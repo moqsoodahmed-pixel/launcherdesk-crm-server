@@ -1,0 +1,127 @@
+const mongoose = require("mongoose");
+
+// One document = one WhatsApp message (inbound or outbound)
+const whatsAppMessageSchema = new mongoose.Schema(
+  {
+    // Parent conversation thread
+    conversation: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "WhatsAppConversation",
+      required: true,
+    },
+
+    // "inbound"  = message received FROM the customer/lead
+    // "outbound" = message sent BY agent to customer
+    direction: {
+      type: String,
+      enum: ["inbound", "outbound"],
+      required: true,
+    },
+
+    // Message content
+    body: {
+      type: String,
+      default: "",
+    },
+
+    // ── CRM-side edit tracking ────────────────────────────────────────────────
+    // IMPORTANT: WhatsApp's Business API has no "edit sent message" endpoint, so
+    // editing here changes ONLY the copy stored in this CRM. The lead still sees
+    // the ORIGINAL text on their phone. originalBody preserves what was actually
+    // delivered, so the true record is never lost.
+    originalBody: {
+      type: String,
+      default: null,
+    },
+    editedAt: {
+      type: Date,
+      default: null,
+    },
+    editedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+
+    // Message type — text is most common; others for media/interactive
+    messageType: {
+      type: String,
+      enum: ["text", "image", "document", "audio", "video", "sticker", "location", "template", "interactive", "reaction", "unknown"],
+      default: "text",
+    },
+
+    // Meta's / MSG91's message ID — used to prevent duplicates and track delivery status
+    // IMPORTANT: sparse:true with unique only skips documents where the field is
+    // completely absent (undefined). Storing null still participates in the unique
+    // index on many MongoDB versions and causes E11000 on the 2nd null.
+    // Solution: controller always stores either the real ID or a generated UUID —
+    // never null. Default here is left out intentionally so undefined skips the index.
+    waMessageId: {
+      type:   String,
+      unique: true,
+      sparse: true,
+      trim:   true,
+      // No `default` — stays undefined (not null) when omitted,
+      // which is properly skipped by the sparse index.
+    },
+
+    // For media messages — URL to download the media from Meta
+    mediaId: {
+      type: String,
+      default: null,
+    },
+
+    mediaUrl: {
+      type: String,
+      default: null,
+    },
+
+    mediaMimeType: {
+      type: String,
+      default: null,
+    },
+
+    mediaCaption: {
+      type: String,
+      default: null,
+    },
+
+    // For outbound: which agent sent this (null = system/auto)
+    sentBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+
+    // Message delivery/read status (updated via Meta status webhooks)
+    // sent → delivered → read (or failed)
+    status: {
+      type: String,
+      enum: ["pending", "sent", "delivered", "read", "failed"],
+      default: "pending",
+    },
+
+    // Exact time Meta received/sent the message (from webhook timestamp)
+    waTimestamp: {
+      type: Date,
+      default: Date.now,
+    },
+
+    // Is this a template message? (required for messages after 24h window)
+    isTemplate: {
+      type: Boolean,
+      default: false,
+    },
+
+    templateName: {
+      type: String,
+      default: null,
+    },
+  },
+  { timestamps: true }
+);
+
+// Index for fast conversation history retrieval
+whatsAppMessageSchema.index({ conversation: 1, waTimestamp: 1 });
+
+module.exports = mongoose.model("WhatsAppMessage", whatsAppMessageSchema);

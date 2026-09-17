@@ -1,0 +1,295 @@
+// utils/leadActionSummary.js
+// ─────────────────────────────────────────────────────────────────────────────
+// LEAD ACTION SUMMARY — powered by Grok (xAI)
+//
+// Builds an actionable summary for a lead so the employee knows the next best
+// step, based on the history of REMARKS the team logged. On Pro/Advance plans
+// the available call TRANSCRIPTS and per-call AI summaries are folded in for a
+// richer result.
+//
+// Provider: Grok (xAI). The xAI API is OpenAI-compatible.
+//   GROK_API_URL  (default https://api.x.ai/v1/chat/completions)
+//   GROK_API_KEY  (required — no OpenAI fallback by design)
+//   GROK_MODEL    (default grok-2-latest)
+//
+// To run Grok behind your own tunnel (e.g. ngrok → a self-hosted gateway),
+// set GROK_API_URL to that tunnel URL; the request/response shape stays
+// OpenAI-compatible.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const axios = require('axios');
+
+// ── AI summary provider config ────────────────────────────────────────────────
+// This feature now uses Groq (OpenAI-compatible chat API) so it can reuse the
+// existing GROQ_API_KEY already set on the server. Everything is overridable via
+// env, so you can still point this at xAI Grok or any OpenAI-compatible gateway
+// without a code change:
+//   AI_SUMMARY_API_KEY / GROQ_API_KEY / GROK_API_KEY  — first one set wins
+//   AI_SUMMARY_API_URL  (default: Groq chat completions)
+//   AI_SUMMARY_MODEL    (default: llama-3.3-70b-versatile)
+// Legacy GROK_* names are still honoured so nothing else breaks.
+const AI_SUMMARY_API_KEY =
+  process.env.AI_SUMMARY_API_KEY ||
+  process.env.GROQ_API_KEY ||
+  process.env.GROK_API_KEY ||
+  '';
+
+const GROK_API_URL =
+  process.env.AI_SUMMARY_API_URL ||
+  process.env.GROK_API_URL ||
+  'https://api.groq.com/openai/v1/chat/completions';
+
+const GROK_MODEL =
+  process.env.AI_SUMMARY_MODEL ||
+  process.env.GROK_MODEL ||
+  'llama-3.3-70b-versatile';
+
+// ── Low-level chat call (OpenAI-compatible: works for Groq or xAI Grok) ───────
+async function callGrok(systemPrompt, userContent, maxTokens = 700) {
+  if (!AI_SUMMARY_API_KEY) {
+    const err = new Error('No AI summary key set. Add GROQ_API_KEY (or AI_SUMMARY_API_KEY) to your environment to enable AI summaries.');
+    err.code = 'GROK_NOT_CONFIGURED';
+    throw err;
+  }
+
+  let data;
+  // Retry on transient rate limits (HTTP 429). The provider occasionally
+  // returns 429 under load or tight per-minute limits; a short backoff (honoring
+  // Retry-After) recovers most of these so they never surface as "AI is busy".
+  // Centralized here so EVERY AI feature (mobile call summary, Meta analysis,
+  // non-conversion, custom reports) gets the same resilience.
+  const MAX_RETRIES = 2;
+  let attempt = 0;
+  for (;;) {
+    try {
+      ({ data } = await axios.post(
+        GROK_API_URL,
+        {
+          model:       GROK_MODEL,
+          max_tokens:  maxTokens,
+          temperature: 0.3,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user',   content: userContent  },
+          ],
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${AI_SUMMARY_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 45000,
+        },
+      ));
+      break; // success
+    } catch (e) {
+      const status = e?.response?.status;
+      // A 413 means the prompt was too large for the provider. buildContext now
+      // bounds the size so this should not happen, but if it still does we tag it
+      // clearly instead of masking it as a generic "busy" error.
+      if (status === 413) {
+        const err = new Error('AI summary input was too large to process.');
+        err.code = 'GROK_PAYLOAD_TOO_LARGE';
+        throw err;
+      }
+      // Transient rate limit → wait and retry.
+      if (status === 429 && attempt < MAX_RETRIES) {
+        const retryAfter = Number(e?.response?.headers?.['retry-after']);
+        const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : 1500 * Math.pow(2, attempt); // 1.5s, then 3s
+        await new Promise((r) => setTimeout(r, waitMs));
+        attempt++;
+        continue;
+      }
+      throw e;
+    }
+  }
+
+  // OpenAI-compatible response shape
+  return (data.choices?.[0]?.message?.content || '').trim();
+}
+
+// ── Build the text block from a lead's remarks + (optional) transcripts ───────
+// Returns { text, hasTranscripts, remarkCount }.
+//
+// SIZE LIMITS (prevents HTTP 413 "payload too large" from the LLM API):
+//   A lead with a long history (dozens of calls / many transcripts) used to
+//   concatenate EVERYTHING into one prompt, which exceeded the provider's
+//   request-size limit → 413, surfaced to the app as "AI summary service is
+//   busy". We now keep only the MOST RECENT entries (recency matters most for
+//   deciding the next action) and enforce a hard total character ceiling.
+const MAX_REMARKS        = 40;     // most recent call-history remarks
+const MAX_MEETINGS       = 15;     // most recent meeting remarks
+const MAX_TRANSCRIPTS    = 6;      // most recent transcripts folded in
+const MAX_TRANSCRIPT_LEN = 1500;   // per-transcript char cap
+const MAX_CONTEXT_CHARS  = 12000;  // hard ceiling on the whole context block
+
+function buildContext(lead, { includeTranscripts } = {}) {
+  const lines = [];
+  let remarkCount = 0;
+  let hasTranscripts = false;
+
+  // 1. Call-history remarks (the core signal on every plan).
+  // Keep only the most recent MAX_REMARKS — sorted oldest→newest for reading,
+  // but we slice the TAIL so the latest activity is always included.
+  const callHistory = Array.isArray(lead.callHistory) ? lead.callHistory : [];
+  const sortedCalls = [...callHistory]
+    .sort((a, b) => new Date(a.calledAt || 0) - new Date(b.calledAt || 0))
+    .slice(-MAX_REMARKS);
+  for (const c of sortedCalls) {
+    const date = c.calledAt ? new Date(c.calledAt).toLocaleDateString('en-IN') : '';
+    const parts = [
+      `[Remark ${date}]`,
+      c.outcome ? `Outcome: ${c.outcome}` : '',
+      c.remark  ? `Note: ${c.remark}`     : '',
+    ].filter(Boolean);
+    if (c.remark || c.outcome) { lines.push(parts.join(' | ')); remarkCount++; }
+  }
+
+  // 2. Meeting remarks (field visits / demos) — most recent only.
+  const meetingRemarks = (Array.isArray(lead.meetingRemarks) ? lead.meetingRemarks : [])
+    .slice(-MAX_MEETINGS);
+  for (const m of meetingRemarks) {
+    const date = m.metAt ? new Date(m.metAt).toLocaleDateString('en-IN') : '';
+    const parts = [
+      `[Meeting ${date}]`,
+      m.meetingType ? `Type: ${m.meetingType}` : '',
+      m.outcome     ? `Outcome: ${m.outcome}`  : '',
+      m.remark      ? `Note: ${m.remark}`      : '',
+    ].filter(Boolean);
+    if (m.remark || m.outcome) { lines.push(parts.join(' | ')); remarkCount++; }
+  }
+
+  // 3. Pro/Advance only — call transcripts + per-call AI summaries.
+  // Cap the COUNT of transcripts (each was already length-capped) — many
+  // recordings × full transcripts is the main 413 driver. Prefer the most recent.
+  if (includeTranscripts && Array.isArray(lead._callRecordings)) {
+    const recs = lead._callRecordings.slice(-MAX_TRANSCRIPTS);
+    for (const rec of recs) {
+      if (rec.transcript && rec.transcript.trim()) {
+        hasTranscripts = true;
+        const t = rec.transcript.trim().slice(0, MAX_TRANSCRIPT_LEN);
+        lines.push(`[Call Transcript]\n${t}`);
+      }
+      if (rec.summary && rec.summary.summary) {
+        hasTranscripts = true;
+        lines.push(`[Call AI Summary] ${rec.summary.summary}${rec.summary.nextAction ? ` (Next: ${rec.summary.nextAction})` : ''}`);
+      }
+    }
+  }
+
+  // Hard ceiling: if the combined block is still too big, keep the TAIL
+  // (most recent content) up to MAX_CONTEXT_CHARS. This guarantees the request
+  // never trips the provider's payload limit regardless of history size.
+  let text = lines.join('\n\n');
+  if (text.length > MAX_CONTEXT_CHARS) {
+    text = text.slice(text.length - MAX_CONTEXT_CHARS);
+    // Drop a possibly-truncated first line so we don't start mid-entry.
+    const nl = text.indexOf('\n');
+    if (nl > 0) text = text.slice(nl + 1);
+  }
+
+  return { text, hasTranscripts, remarkCount };
+}
+
+// ── Main: generate an action summary for a lead ───────────────────────────────
+// @param lead — a lead doc (lean or hydrated). For Pro/Advance, attach
+//   lead._callRecordings = [{ transcript, summary }] before calling.
+// @param opts.includeTranscripts — true on Pro/Advance
+// @returns { summary, nextAction, keyPoints[], sentiment, suggestedTemp, basedOn, model }
+async function generateLeadActionSummary(lead, opts = {}) {
+  const includeTranscripts = !!opts.includeTranscripts;
+  const contactName = lead.name || 'the customer';
+
+  const { text, hasTranscripts, remarkCount } = buildContext(lead, { includeTranscripts });
+
+  if (!text || remarkCount === 0 && !hasTranscripts) {
+    return {
+      summary:       'No remarks or call history yet for this lead.',
+      nextAction:    'Make first contact and log a remark.',
+      keyPoints:     [],
+      sentiment:     'Neutral',
+      suggestedTemp: null,
+      basedOn:       includeTranscripts ? 'remarks+calls' : 'remarks',
+      model:         GROK_MODEL,
+    };
+  }
+
+  const basedOn = (includeTranscripts && hasTranscripts) ? 'remarks+calls' : 'remarks';
+
+  const systemPrompt =
+    'You are a CRM sales assistant. You read the history of a single lead and help ' +
+    'the salesperson decide the next best action. Always respond with valid JSON only — ' +
+    'no markdown, no preamble.';
+
+  const userContent =
+    `Lead name: "${contactName}".\n` +
+    `Below is the chronological history of interactions${basedOn === 'remarks+calls' ? ' (remarks + call transcripts/summaries)' : ' (remarks logged by the team)'}:\n\n` +
+    `"""\n${text}\n"""\n\n` +
+    `Based on everything above, respond ONLY with this JSON:\n` +
+    `{\n` +
+    `  "summary": "3-4 sentence summary of where this lead stands and what has happened",\n` +
+    `  "keyPoints": ["short bullet 1", "short bullet 2", "short bullet 3"],\n` +
+    `  "sentiment": "Positive" | "Neutral" | "Negative",\n` +
+    `  "nextAction": "the single most useful next step the salesperson should take",\n` +
+    `  "suggestedTemp": "Hot" | "Warm" | "Cold" | null\n` +
+    `}`;
+
+  const raw = await callGrok(systemPrompt, userContent, 800);
+  const clean = raw.replace(/^```json\s*/i, '').replace(/\s*```$/, '').trim();
+
+  let parsed;
+  try {
+    parsed = JSON.parse(clean);
+  } catch {
+    // Model returned prose — degrade gracefully rather than failing the request.
+    return {
+      summary:       clean.slice(0, 500) || 'Could not parse summary.',
+      nextAction:    'Review the lead history manually.',
+      keyPoints:     [],
+      sentiment:     'Neutral',
+      suggestedTemp: null,
+      basedOn,
+      model:         GROK_MODEL,
+    };
+  }
+
+  return {
+    summary:       parsed.summary    || '',
+    nextAction:    parsed.nextAction || '',
+    keyPoints:     Array.isArray(parsed.keyPoints) ? parsed.keyPoints.slice(0, 6) : [],
+    sentiment:     ['Positive', 'Neutral', 'Negative'].includes(parsed.sentiment) ? parsed.sentiment : 'Neutral',
+    suggestedTemp: ['Hot', 'Warm', 'Cold'].includes(parsed.suggestedTemp) ? parsed.suggestedTemp : null,
+    basedOn,
+    model:         GROK_MODEL,
+  };
+}
+
+// ── Signature of the inputs — used to cache & detect staleness ────────────────
+// Cheap fingerprint: counts + latest timestamps of remarks/meetings/recordings.
+// If this string changes, the cached summary is regenerated.
+function computeSummarySignature(lead, includeTranscripts) {
+  const ch = Array.isArray(lead.callHistory) ? lead.callHistory : [];
+  const mr = Array.isArray(lead.meetingRemarks) ? lead.meetingRemarks : [];
+  const recs = includeTranscripts && Array.isArray(lead._callRecordings) ? lead._callRecordings : [];
+
+  const latest = (arr, key) =>
+    arr.reduce((m, x) => Math.max(m, new Date(x[key] || 0).getTime() || 0), 0);
+
+  const transcriptChars = recs.reduce((n, r) => n + (r.transcript ? r.transcript.length : 0), 0);
+
+  return [
+    includeTranscripts ? 'rc' : 'r',
+    ch.length, latest(ch, 'calledAt'),
+    mr.length, latest(mr, 'metAt'),
+    recs.length, transcriptChars,
+  ].join(':');
+}
+
+module.exports = {
+  generateLeadActionSummary,
+  computeSummarySignature,
+  callGrok,
+  GROK_MODEL,
+};

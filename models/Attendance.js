@@ -1,0 +1,88 @@
+const mongoose = require("mongoose");
+
+const breakSchema = new mongoose.Schema({
+  startTime: { type: Date, required: true },
+  endTime:   { type: Date, default: null },
+  reason:    { type: String, default: "Manual Break" },
+  durationMinutes: { type: Number, default: null },
+
+  // ── Idle remark (employee-entered reason for an "Auto Idle" gap) ──────────
+  // Prompted every 5 minutes while idle, and again on resume. Only meaningful
+  // for reason === "Auto Idle" — manual breaks already capture their reason
+  // at start time via the `reason` field above.
+  //   "not_required" → manual break, no remark expected
+  //   "pending"      → auto-idle break, employee hasn't filled it in yet
+  //                    (either hasn't been prompted, or skipped the prompt)
+  //   "filled"       → employee entered a remark
+  remark:       { type: String, default: "" },
+  remarkStatus: { type: String, enum: ["pending", "filled", "not_required"], default: "not_required" },
+}, { _id: false });
+
+const attendanceSchema = new mongoose.Schema({
+  user:    { type: mongoose.Schema.Types.ObjectId, ref: "User",    required: true },
+  company: { type: mongoose.Schema.Types.ObjectId, ref: "Company", required: true },
+  date:    { type: String, required: true }, // "YYYY-MM-DD"
+
+  loginTime:  { type: Date, default: null },
+  logoutTime: { type: Date, default: null },
+
+  // Live tracking status (internal)
+  status: {
+    type: String,
+    enum: ["active", "on_break", "idle", "logged_out"],
+    default: "active",
+  },
+
+  breaks: { type: [breakSchema], default: [] },
+
+  totalWorkMinutes:  { type: Number, default: 0 },
+  totalBreakMinutes: { type: Number, default: 0 },
+
+  lastActivity:     { type: Date, default: null },
+  activeBreakIndex: { type: Number, default: null },
+
+  // ── CRM Attendance fields (admin-visible / editable) ─────────────────────
+  // Manual override for attendance classification.
+  // If null, status is auto-derived in the controller (present / late / half_day / absent).
+  crmStatus: {
+    type: String,
+    enum: ["present", "absent", "late", "half_day", "leave", "holiday", null],
+    default: null,
+  },
+
+  remarks: { type: String, default: "" },
+
+  // ── Device / app info captured at clock-in ────────────────────────────────
+  appName:     { type: String, default: null },
+  appVersion:  { type: String, default: null },
+  platform:    { type: String, default: null },
+  deviceModel: { type: String, default: null },
+  osVersion:   { type: String, default: null },
+  fcmToken:    { type: String, default: null },
+
+  // ── Clock-in location (captured from device GPS) ──────────────────────────
+  clockInLatitude:  { type: Number, default: null },
+  clockInLongitude: { type: Number, default: null },
+
+  // ── Clock-out location (captured from device GPS at clock-out) ────────────
+  clockOutLatitude:  { type: Number, default: null },
+  clockOutLongitude: { type: Number, default: null },
+
+  // True when today's clock-in used a granted remote/meeting permission (i.e. a
+  // field / off-site session). Persisted per-day because the one-time
+  // clientMeetingPermission on the User is consumed at clock-in; locationPing
+  // authorizes GPS pings off THIS flag for the whole session.
+  remoteClockIn: { type: Boolean, default: false },
+
+  // ── Ideal working time + reason (set by the employee from the mobile app) ──
+  // Free-text planned working window (e.g. "11:00 AM - 7:00 PM") and the reason
+  // for it. Displayed on the admin / super-admin attendance pages.
+  idealTime:   { type: String, default: "" },
+  idealRemark: { type: String, default: "" },
+
+}, { timestamps: true });
+
+attendanceSchema.index({ user: 1, date: 1 }, { unique: true });
+attendanceSchema.index({ company: 1, date: 1 });
+
+module.exports = mongoose.model("Attendance", attendanceSchema);

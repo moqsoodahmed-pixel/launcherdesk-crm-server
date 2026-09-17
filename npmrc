@@ -1,0 +1,5 @@
+# Skip Puppeteer browser downloads during npm install.
+# Puppeteer is a transitive dependency (used by whatsapp-web.js internally).
+# The CRM does not launch a browser directly, so chrome-headless-shell is not needed.
+# If you ever need Puppeteer's browser, remove this line and run: npx puppeteer browsers install chrome
+PUPPETEER_SKIP_DOWNLOAD=true

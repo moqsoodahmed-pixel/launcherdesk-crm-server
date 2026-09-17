@@ -1,0 +1,1259 @@
+const Attendance    = require("../models/Attendance");
+const User          = require("../models/Users");
+const Company       = require("../models/Company");
+const LiveLocation   = require("../models/LiveLocation");
+const ClockLocationLog = require("../models/ClockLocationLog");
+
+// ── Socket helper — emits attendance:updated to the user's private room ───────
+// The room name is `att:<userId>`. Both web and mobile join this room on mount.
+// If io isn't set yet (e.g. tests), the emit is silently skipped.
+function emitAttendanceUpdate(req, record) {
+  try {
+    const io = req.app.get("io") || global._io;
+    if (!io) return;
+    const userId = String(req.user._id);
+    io.to(`att:${userId}`).emit("attendance:updated", record);
+  } catch (e) {
+    // Never let a socket error crash the HTTP response
+    console.error("[socket] emitAttendanceUpdate error:", e.message);
+  }
+}
+
+// ── Permanently record a clock-in/out location (append-only, never deleted) ──
+// Writes to ClockLocationLog so the location survives even if the daily
+// Attendance record is later edited or deleted. Fire-and-forget: a logging
+// failure must never block the clock-in/out itself.
+async function logClockLocation({ record, type, latitude, longitude, accuracy, address }) {
+  try {
+    if (latitude == null || longitude == null) return;
+    await ClockLocationLog.create({
+      user:      record.user,
+      company:   record.company,
+      type,                                // 'clock_in' | 'clock_out'
+      date:      record.date,
+      latitude:  Number(latitude),
+      longitude: Number(longitude),
+      accuracy:  accuracy != null ? Number(accuracy) : null,
+      address:   address || null,
+    });
+  } catch (e) {
+    console.error("[attendance] logClockLocation error:", e.message);
+  }
+}
+
+// ── Push clock-in / clock-out location to admins + super admins ──────────────
+// Both admins and super admins in a company join the `company_admin:<company>`
+// room, so a single emit reaches everyone who should see it. Fired on clock-in
+// and clock-out with the employee's captured GPS coordinates. The coordinates
+// are also persisted on the Attendance record (clockIn*/clockOut*), so admins
+// can see them later in the attendance report as well as live here.
+async function emitClockLocationToAdmins(req, { record, type, latitude, longitude, accuracy }) {
+  try {
+    if (latitude == null || longitude == null) return; // nothing to send
+    const io = req.app.get("io") || global._io;
+    if (!io) return;
+
+    let name = req.user?.name;
+    if (!name) {
+      const u = await User.findById(record.user).select("name").lean();
+      name = u?.name || "Employee";
+    }
+
+    io.to(`company_admin:${String(record.company)}`).emit("attendance_location", {
+      userId:    String(record.user),
+      name,
+      type,                                   // 'clock_in' | 'clock_out'
+      latitude:  Number(latitude),
+      longitude: Number(longitude),
+      accuracy:  accuracy != null ? Number(accuracy) : null,
+      date:      record.date,
+      at:        new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("[socket] emitClockLocationToAdmins error:", e.message);
+  }
+}
+
+// Helpers
+//
+// FIX (clock/timezone bug): the whole app runs on IST, but this used to do
+// `new Date().toISOString().slice(0, 10)`, which is always the UTC date.
+// Between 12:00 AM and 5:30 AM IST, the UTC date is still "yesterday", so any
+// clock-in in that window was silently filed under the wrong day — and the
+// mobile app / website would each show a different "today" record depending
+// on what the device thought the date was. All "today" helpers below now
+// compute the date using the IST wall-clock instead of UTC.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // +05:30 in ms
+
+function toIST(date) {
+  return new Date(new Date(date).getTime() + IST_OFFSET_MS);
+}
+
+function todayStr() {
+  return toIST(new Date()).toISOString().slice(0, 10);
+}
+
+function calcBreakMinutes(breaks) {
+  return breaks.reduce((sum, b) => {
+    if (b.startTime && b.endTime)
+      return sum + Math.round((new Date(b.endTime) - new Date(b.startTime)) / 60000);
+    return sum;
+  }, 0);
+}
+
+// Idle time = the automatic "Auto Idle" gaps only (NOT manual breaks).
+// The app records inactivity as a break with reason "Auto Idle"; manual breaks
+// use any other reason. We total only the auto-idle ones for the Idle column.
+function calcIdleMinutes(breaks) {
+  return (breaks || []).reduce((sum, b) => {
+    if (b.reason === "Auto Idle" && b.startTime && b.endTime)
+      return sum + Math.round((new Date(b.endTime) - new Date(b.startTime)) / 60000);
+    return sum;
+  }, 0);
+}
+
+// Manual break minutes = all breaks EXCEPT the auto-idle ones.
+function calcManualBreakMinutes(breaks) {
+  return (breaks || []).reduce((sum, b) => {
+    if (b.reason !== "Auto Idle" && b.startTime && b.endTime)
+      return sum + Math.round((new Date(b.endTime) - new Date(b.startTime)) / 60000);
+    return sum;
+  }, 0);
+}
+
+/** Determine CRM attendance status from a raw record.*  Present / Late / Half-day / Absent / Leave  */
+function deriveCrmStatus(rec, shiftCfg) {
+  if (!rec || !rec.loginTime) return "absent";
+  // FIX (clock/timezone bug): .getHours()/.getMinutes() read the SERVER
+  // PROCESS's local timezone (often UTC on cloud hosts like Render), not
+  // IST. That made the late cutoff below fire at the wrong wall-clock time
+  // whenever the server's TZ wasn't Asia/Kolkata. Use the IST-shifted
+  // timestamp and its UTC getters instead, so this is correct regardless of
+  // the host machine's configured timezone.
+  const istLogin      = toIST(rec.loginTime);
+  const loginHour     = istLogin.getUTCHours();
+  const loginMin      = istLogin.getUTCMinutes();
+  const totalMinutes = loginHour * 60 + loginMin;
+  const workMins    = rec.totalWorkMinutes || 0;
+
+  if (rec.crmStatus) return rec.crmStatus; // manual override wins
+
+  // FIX: this was hardcoded to 9:30 AM (570 minutes) regardless of company
+  // settings. Company.attendanceConfig.lateLoginHour/lateLoginMinute already
+  // exists specifically for this — there's a full admin UI for it on the
+  // Attendance Settings page (AttendancePage.jsx "Mark Late After") — but
+  // nothing actually read it back here, so changing that setting had no
+  // effect on which employees got marked "late". Falls back to 9:30 (the old
+  // hardcoded default) when no config is passed, so this stays correct even
+  // from call sites that haven't been updated to fetch it.
+  const lateThresholdMinutes =
+    shiftCfg?.lateLoginHour != null
+      ? shiftCfg.lateLoginHour * 60 + (shiftCfg.lateLoginMinute || 0)
+      : 570;
+
+  if (totalMinutes > lateThresholdMinutes) return "late";
+  if (workMins > 0 && workMins < 240) return "half_day";
+  return "present";
+}
+
+// ── Haversine distance (metres) between two lat/lng points ───────────────────
+function haversineMetres(lat1, lon1, lat2, lon2) {
+  const R    = 6_371_000; // Earth radius in metres
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a    =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// ── USER: Clock In ────────────────────────────────────────────────────────────
+const DEVICE_FIELDS_ATT = ["appName", "appVersion", "platform", "deviceModel", "osVersion", "fcmToken"];
+
+const clockIn = async (req, res) => {
+  try {
+    const userId    = req.user._id;
+    const companyId = req.user.company;
+    const date      = todayStr();
+
+    // ── Location enforcement ─────────────────────────────────────────────────
+    // Fetch company settings and user meeting-permission in parallel instead
+    // of sequentially — the user doc was previously only fetched AFTER
+    // company.findById resolved, and only if location enforcement was on.
+    // Fetching both up front costs nothing extra when enforcement is off
+    // (the userDoc is simply unused) and saves one full round-trip when it's on.
+    const [company, userDoc] = await Promise.all([
+      Company.findById(companyId)
+        .select('clockInLocationEnabled clockInLatitude clockInLongitude clockInRadiusMeters')
+        .lean(),
+      User.findById(userId)
+        .select('clientMeetingPermission clientMeetingPermissionGrantedAt')
+        .lean(),
+    ]);
+
+    // Tracks whether this clock-in relied on a remote meeting permission, so we
+    // can consume (reset) that permission afterwards — a granted permission is
+    // valid for ONE clock-in only, not a standing 24h pass.
+    let usedMeetingPermission = false;
+
+    if (company?.clockInLocationEnabled && company.clockInLatitude && company.clockInLongitude) {
+      // Check if employee has client-meeting permission (bypasses location check)
+
+      const hasMeetingPermission = (() => {
+        if (!userDoc?.clientMeetingPermission) return false;
+        // Permission auto-expires after 24 hours
+        if (!userDoc.clientMeetingPermissionGrantedAt) return false;
+        const grantedAt = new Date(userDoc.clientMeetingPermissionGrantedAt);
+        return (Date.now() - grantedAt.getTime()) < 24 * 60 * 60 * 1000;
+      })();
+
+      usedMeetingPermission = hasMeetingPermission;
+
+      if (!hasMeetingPermission) {
+        // Require device location from request body
+        const { latitude, longitude, accuracy } = req.body;
+        if (latitude == null || longitude == null) {
+          return res.status(400).json({
+            message: 'Location required. Please enable location and try again.',
+            code: 'location_required',
+          });
+        }
+
+        const dist = haversineMetres(
+          Number(latitude), Number(longitude),
+          company.clockInLatitude, company.clockInLongitude,
+        );
+
+        // Allow the device's reported GPS accuracy as extra tolerance (capped),
+        // so a user who is genuinely at the office but only has a coarse fix
+        // isn't rejected over and over ("too far"/many attempts). A precise fix
+        // (small accuracy) adds little slack; a coarse one adds more, up to a
+        // sensible cap so it can't be abused.
+        const radius    = 100; // office geofence radius is fixed at 100m
+        const accSlack  = Math.min(Number(accuracy) || 0, 150); // cap tolerance at 150m
+        const allowed   = radius + accSlack;
+
+        if (dist > allowed) {
+          return res.status(403).json({
+            message: `You are ${Math.round(dist)}m from the office. Clock-in is only allowed within ${radius}m. If you are at a client meeting, request remote clock-in permission from your admin.`,
+            code:          'outside_radius',
+            distanceMetres: Math.round(dist),
+            radiusMetres:   radius,
+          });
+        }
+      }
+    }
+
+    // ── Pull device / app info if the mobile app sent it ──────────────────────
+    const deviceFields = {};
+    DEVICE_FIELDS_ATT.forEach(f => {
+      if (req.body[f] !== undefined && req.body[f] !== null) {
+        deviceFields[f] = req.body[f];
+      }
+    });
+
+    // Store clock-in coordinates for audit
+    if (req.body.latitude != null) deviceFields.clockInLatitude  = Number(req.body.latitude);
+    if (req.body.longitude != null) deviceFields.clockInLongitude = Number(req.body.longitude);
+
+    let record = await Attendance.findOne({ user: userId, date });
+    if (record && record.loginTime && !record.logoutTime)
+      return res.status(400).json({ message: "Already clocked in." });
+
+    if (record && record.loginTime) {
+      // ── RESUME an existing session (second clock-in same day) ───────────────
+      // The earlier bug RESET loginTime to now and zeroed the day's work, which
+      // is why a 10:09am–8:07pm day showed "0h 23m" and got mislabelled
+      // half-day. Instead we keep the ORIGINAL loginTime and accumulated work,
+      // simply reopening the session: clear the logout and any open break, and
+      // do NOT touch totalWorkMinutes here (it's recomputed at clock-out from
+      // original login → logout minus breaks).
+      record.logoutTime       = null;
+      record.status           = "active";
+      record.lastActivity     = new Date();
+      record.activeBreakIndex = null;
+      record.crmStatus        = null; // let status auto-derive again
+      // Refresh device fields on re-clock-in (keep breaks + original login).
+      Object.assign(record, deviceFields);
+      await record.save();
+    } else if (record) {
+      // Record exists for today but never had a login (e.g. a pre-seeded
+      // absent/leave stub) — treat as a fresh clock-in.
+      record.loginTime         = new Date();
+      record.logoutTime        = null;
+      record.status            = "active";
+      record.breaks            = [];
+      record.totalBreakMinutes = 0;
+      record.totalWorkMinutes  = 0;
+      record.lastActivity      = new Date();
+      record.activeBreakIndex  = null;
+      record.crmStatus         = null;
+      Object.assign(record, deviceFields);
+      await record.save();
+    } else {
+      record = await Attendance.create({
+        user: userId, company: companyId, date,
+        loginTime: new Date(), status: "active", lastActivity: new Date(),
+        ...deviceFields,
+      });
+    }
+
+    // Keep User document current (in case login missed it)
+    if (Object.keys(deviceFields).length > 0) {
+      await User.findByIdAndUpdate(userId, { $set: deviceFields });
+    }
+
+    // Persist whether THIS is a remote (meeting/field) clock-in for today.
+    // locationPing authorizes GPS pings off this per-day flag instead of the
+    // ephemeral clientMeetingPermission, which is consumed just below. Without
+    // it, every location ping after a remote clock-in was rejected with
+    // 'no_meeting_permission' and no lat/long was ever stored or displayed.
+    if (record.remoteClockIn !== usedMeetingPermission) {
+      record.remoteClockIn = usedMeetingPermission;
+      await record.save();
+    }
+
+    // Consume the remote permission: a granted approval is good for ONE clock-in.
+    // After using it, reset so the next clock-in requires a fresh request +
+    // fresh admin approval (no standing 24h pass that auto-shows "approved").
+    if (usedMeetingPermission) {
+      await User.findByIdAndUpdate(userId, {
+        $set: {
+          clientMeetingPermission:    false,
+          clientMeetingPermissionGrantedAt: null,
+          clientMeetingPermissionGrantedBy: null,
+          meetingPermissionRequested: false,
+          meetingPermissionStatus:    'none',
+        },
+      });
+    }
+
+    emitAttendanceUpdate(req, record);
+    emitClockLocationToAdmins(req, {
+      record,
+      type: "clock_in",
+      latitude:  record.clockInLatitude,
+      longitude: record.clockInLongitude,
+      accuracy:  req.body?.accuracy,
+    });
+    logClockLocation({
+      record,
+      type: "clock_in",
+      latitude:  record.clockInLatitude,
+      longitude: record.clockInLongitude,
+      accuracy:  req.body?.accuracy,
+      address:   req.body?.address,
+    });
+    res.status(200).json(record);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// ── USER: Clock Out ───────────────────────────────────────────────────────────
+const clockOut = async (req, res) => {
+  try {
+    const date   = todayStr();
+    const record = await Attendance.findOne({ user: req.user._id, date });
+    if (!record || !record.loginTime)
+      return res.status(400).json({ message: "Not clocked in." });
+
+    // Close any open break
+    if (record.activeBreakIndex !== null) {
+      const br = record.breaks[record.activeBreakIndex];
+      if (br && !br.endTime) {
+        br.endTime         = new Date();
+        br.durationMinutes = Math.round((br.endTime - br.startTime) / 60000);
+      }
+    }
+
+    record.logoutTime         = new Date();
+    record.status             = "logged_out";
+    record.totalBreakMinutes  = calcBreakMinutes(record.breaks);
+    const elapsed             = Math.round((record.logoutTime - record.loginTime) / 60000);
+    record.totalWorkMinutes   = Math.max(0, elapsed - record.totalBreakMinutes);
+    record.activeBreakIndex   = null;
+
+    // Capture clock-out GPS (sent by the app), so it's saved and pushed to admins.
+    const { latitude, longitude, accuracy } = req.body || {};
+    if (latitude != null && longitude != null) {
+      record.clockOutLatitude  = Number(latitude);
+      record.clockOutLongitude = Number(longitude);
+    }
+
+    await record.save();
+
+    emitAttendanceUpdate(req, record);
+    emitClockLocationToAdmins(req, {
+      record,
+      type: "clock_out",
+      latitude:  record.clockOutLatitude,
+      longitude: record.clockOutLongitude,
+      accuracy,
+    });
+    logClockLocation({
+      record,
+      type: "clock_out",
+      latitude:  record.clockOutLatitude,
+      longitude: record.clockOutLongitude,
+      accuracy,
+      address:   req.body?.address,
+    });
+    res.status(200).json(record);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// Same cutoff used by markIdleJob.js and the admin live-status view — kept
+// here too so startBreak's cross-device guard (below) stays consistent with
+// how the rest of the system decides what counts as "still active".
+const IDLE_CUTOFF_MS = 5 * 60 * 1000;
+
+// ── USER: Start Break ─────────────────────────────────────────────────────────
+const startBreak = async (req, res) => {
+  try {
+    const { reason = "Manual Break" } = req.body;
+    const date   = todayStr();
+    const record = await Attendance.findOne({ user: req.user._id, date });
+    if (!record || !record.loginTime || record.logoutTime)
+      return res.status(400).json({ message: "Not clocked in." });
+    if (record.activeBreakIndex !== null)
+      return res.status(400).json({ message: "Already on break." });
+
+    // FIX (mobile/web not in sync): an employee working from ONE device
+    // (say, the mobile app, pinging /attendance/ping every 60s while they
+    // take calls) could get force-marked "Idle" by the OTHER device (the
+    // web dashboard's client-side inactivity timer, which fires this
+    // endpoint with reason "Auto Idle" purely based on that browser tab's
+    // own mouse/keyboard silence). Both devices share the same attendance
+    // record, so before honoring an Auto-Idle request we check
+    // `lastActivity` — the single cross-device freshness signal both apps
+    // update on every ping/heartbeat. If it was touched within the idle
+    // cutoff (meaning the employee is demonstrably active somewhere), we
+    // skip marking idle and just return the record as-is, still "active",
+    // instead of letting one idle browser tab override real activity
+    // happening on the other platform.
+    if (reason === "Auto Idle" && record.lastActivity &&
+        (Date.now() - new Date(record.lastActivity).getTime()) < IDLE_CUTOFF_MS) {
+      return res.status(200).json(record);
+    }
+
+    record.breaks.push({
+      startTime: new Date(),
+      reason,
+      // New auto-idle breaks start pending a remark; manual breaks don't need one.
+      remarkStatus: reason === "Auto Idle" ? "pending" : "not_required",
+    });
+    record.activeBreakIndex = record.breaks.length - 1;
+    record.status = reason === "Auto Idle" ? "idle" : "on_break";
+    await record.save();
+    emitAttendanceUpdate(req, record);
+    res.status(200).json(record);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// ── USER: End Break ───────────────────────────────────────────────────────────
+const endBreak = async (req, res) => {
+  try {
+    const date   = todayStr();
+    const record = await Attendance.findOne({ user: req.user._id, date });
+    if (!record || record.activeBreakIndex === null)
+      return res.status(400).json({ message: "Not on break." });
+
+    const br           = record.breaks[record.activeBreakIndex];
+    br.endTime         = new Date();
+    br.durationMinutes = Math.round((br.endTime - br.startTime) / 60000);
+    record.totalBreakMinutes = calcBreakMinutes(record.breaks);
+    record.activeBreakIndex  = null;
+    record.status            = "active";
+    record.lastActivity      = new Date();
+    await record.save();
+    emitAttendanceUpdate(req, record);
+    res.status(200).json(record);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// ── USER: Ping Activity ───────────────────────────────────────────────────────
+const pingActivity = async (req, res) => {
+  try {
+    const date   = todayStr();
+    const record = await Attendance.findOne({ user: req.user._id, date });
+    if (!record || !record.loginTime || record.logoutTime)
+      return res.status(200).json({ ok: true });
+
+    record.lastActivity = new Date();
+    const wasIdle = record.status === "idle";
+    if (wasIdle) {
+      if (record.activeBreakIndex !== null) {
+        const br = record.breaks[record.activeBreakIndex];
+        if (br && !br.endTime) {
+          br.endTime         = new Date();
+          br.durationMinutes = Math.round((br.endTime - br.startTime) / 60000);
+        }
+      }
+      record.activeBreakIndex  = null;
+      record.status            = "active";
+      record.totalBreakMinutes = calcBreakMinutes(record.breaks);
+    }
+    await record.save();
+
+    // FIX: this endpoint used to save the idle→active transition and just
+    // return it in the HTTP response — but the periodic 60s background ping
+    // on both web and mobile fires-and-forgets this call without reading the
+    // response, and neither client re-fetches afterwards. So the backend
+    // would correctly flip the employee back to "active", while their own
+    // widget kept showing "Idle" — with no visible "Resume" button left to
+    // fix it (that banner was already dismissed locally on the first mouse
+    // move / tap), until a full page reload or app restart. UserDashboard.jsx
+    // and the mobile AttendanceWidget both already have a live socket
+    // listener for "attendance:updated" (used by clockIn/clockOut/startBreak/
+    // endBreak) — this was simply the one mutating endpoint that never emitted
+    // it. Only emit when something actually changed, to avoid a socket burst
+    // on every idle heartbeat from every active employee.
+    if (wasIdle) emitAttendanceUpdate(req, record);
+
+    res.status(200).json({ ok: true, status: record.status });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// ── USER: Save/skip an idle remark ────────────────────────────────────────────
+// Called by the web + mobile idle popup, both while still idle (repeated
+// every 5 min) and once on resume. Targets the CURRENTLY active idle break by
+// default, but can also target an earlier one via `breakIndex` — the popup
+// carries forward any still-"pending" remarks from earlier idle periods today
+// so the employee can fill them in later without losing track of them, per
+// spec: skipping just leaves it pending, it doesn't block anything, and it
+// stays visible next time the popup shows.
+// Body: { remark, breakIndex? }  — empty/missing remark = explicit skip
+// (re-affirms "pending" rather than leaving it in whatever state it was).
+const saveIdleRemark = async (req, res) => {
+  try {
+    const { remark, breakIndex } = req.body || {};
+    const date   = todayStr();
+    const record = await Attendance.findOne({ user: req.user._id, date });
+    if (!record) return res.status(404).json({ message: "No attendance record for today." });
+
+    const idx = breakIndex !== undefined && breakIndex !== null
+      ? Number(breakIndex)
+      : record.activeBreakIndex;
+
+    if (idx === null || idx === undefined || !record.breaks[idx])
+      return res.status(400).json({ message: "No matching idle period found." });
+
+    const br = record.breaks[idx];
+    if (br.reason !== "Auto Idle")
+      return res.status(400).json({ message: "Remarks can only be added to auto-idle periods." });
+
+    const trimmed = String(remark || "").trim().slice(0, 300);
+    br.remark       = trimmed;
+    br.remarkStatus = trimmed ? "filled" : "pending"; // empty = explicit skip, stays pending
+
+    await record.save();
+    emitAttendanceUpdate(req, record);
+    res.status(200).json(record);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// ── USER: Get today's record ──────────────────────────────────────────────────
+const getMyToday = async (req, res) => {
+  try {
+    const record = await Attendance.findOne({ user: req.user._id, date: todayStr() });
+    if (!record) return res.status(200).json(null);
+    res.status(200).json(record);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// ── Save ideal working time + reason for today (employee, from mobile app) ────
+// Upserts today's attendance record (a user may set their ideal time before
+// clocking in), and returns the full updated record so the app can refresh.
+// ── "Ideal Time" retired as a per-employee free-text field ───────────────────
+// It used to be something each employee typed in daily, which made it drift
+// into meaning "what I actually worked" rather than a fixed shift window.
+// Replaced by getShiftConfig below — a single company-wide shift window the
+// admin sets once (Attendance Settings page), which every employee just reads.
+
+// ── Get the company's fixed shift window (read-only, any employee) ───────────
+// "Ideal Time" is now this — the admin-configured shift window that applies
+// to everyone, NOT something derived from any individual's clock-in/clock-out
+// times and NOT something an employee can edit. Backed by the same
+// Company.attendanceConfig that already powers the "late" threshold and the
+// Attendance Settings admin page (adminController.js getAttendanceConfig) —
+// this just exposes the shift-window portion of it to non-admin callers.
+const getShiftConfig = async (req, res) => {
+  try {
+    const companyId = req.user.company;
+    const company = await Company.findById(companyId).select("attendanceConfig").lean();
+    const cfg = company?.attendanceConfig || {};
+    res.status(200).json({
+      shiftStartHour:   cfg.shiftStartHour   ?? 9,
+      shiftStartMinute: cfg.shiftStartMinute ?? 0,
+      shiftEndHour:      cfg.shiftEndHour     ?? 18,
+      shiftEndMinute:    cfg.shiftEndMinute   ?? 0,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// ── ADMIN: Mark idle users ────────────────────────────────────────────────────
+const markIdleUsers = async (req, res) => {
+  try {
+    const companyId = req.admin.company._id;
+    const date      = todayStr();
+    const cutoff    = new Date(Date.now() - 5 * 60 * 1000);
+
+    const active = await Attendance.find({
+      company: companyId, date, status: "active",
+      lastActivity: { $lt: cutoff },
+    });
+
+    let marked = 0;
+    for (const rec of active) {
+      rec.breaks.push({ startTime: new Date(), reason: "Auto Idle", remarkStatus: "pending" });
+      rec.activeBreakIndex = rec.breaks.length - 1;
+      rec.status = "idle";
+      await rec.save();
+      marked++;
+    }
+    res.status(200).json({ marked });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// ── ADMIN: Get company attendance for a single date (live dashboard) ──────────
+const getCompanyAttendance = async (req, res) => {
+  try {
+    const companyId = req.admin.company._id;
+    const { date = todayStr() } = req.query;
+
+    // Scope: super_admin sees all users; regular admin sees only users they created
+    const userQuery = { company: companyId };
+    if (req.admin.role !== "super_admin") {
+      userQuery.createdBy = req.admin._id;
+    }
+
+    const users   = await User.find(userQuery).select("name email ipAddress appName appVersion platform deviceModel osVersion lastLoginAt loginHistory").lean();
+    const userIds = users.map(u => u._id);
+
+    const records = await Attendance.find({ company: companyId, date, user: { $in: userIds } })
+      .populate("user", "name email ipAddress appName appVersion platform deviceModel osVersion lastLoginAt loginHistory callLogSyncEnabled").lean();
+
+    const recordMap = {};
+    records.forEach(r => { recordMap[String(r.user?._id || r.user)] = r; });
+
+    const now = new Date();
+    const result = users.map(u => {
+      const rec = recordMap[String(u._id)];
+      if (!rec) {
+        return { user: u, date, status: "not_logged_in", loginTime: null, logoutTime: null, totalWorkMinutes: 0, totalBreakMinutes: 0, breaks: [] };
+      }
+      let liveWork = rec.totalWorkMinutes;
+      if (rec.loginTime && !rec.logoutTime) {
+        const breakMins = rec.totalBreakMinutes + (rec.activeBreakIndex !== null
+          ? Math.round((now - new Date(rec.breaks[rec.activeBreakIndex]?.startTime || now)) / 60000) : 0);
+        liveWork = Math.max(0, Math.round((now - new Date(rec.loginTime)) / 60000) - breakMins);
+      }
+      let status = rec.status;
+      if (status === "active" && rec.lastActivity && (now - new Date(rec.lastActivity)) > 5 * 60 * 1000) {
+        status = "idle";
+      }
+      return { ...rec, user: u, status, liveWorkMinutes: liveWork };
+    });
+
+    res.status(200).json(result);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// ── ADMIN: Get attendance with date range + filters (Attendance Management page) ─
+const getAttendanceReport = async (req, res) => {
+  try {
+    const companyId = req.admin.company._id;
+    const {
+      startDate,
+      endDate,
+      userId,
+      crmStatus,   // present | absent | late | half_day | leave
+      page  = 1,
+      limit = 50,
+    } = req.query;
+
+    const today = todayStr();
+    const from  = startDate || today;
+    const to    = endDate   || today;
+
+    // Scope: super_admin sees all users; regular admin sees only their users
+    let allowedUserIds = null;
+    if (req.admin.role !== "super_admin") {
+      const scopedUsers = await User.find({ company: companyId, createdBy: req.admin._id }).select("_id").lean();
+      allowedUserIds = scopedUsers.map(u => u._id);
+    }
+
+    // Build base query
+    const query = { company: companyId, date: { $gte: from, $lte: to } };
+    if (userId) {
+      // If a specific userId is requested, honour it only if it's in the allowed set
+      if (allowedUserIds && !allowedUserIds.some(id => String(id) === String(userId))) {
+        return res.status(200).json({ records: [], total: 0, page: 1, pages: 1 });
+      }
+      query.user = userId;
+    } else if (allowedUserIds) {
+      query.user = { $in: allowedUserIds };
+    }
+
+    // Fetch records
+    const [records, total, companyCfg] = await Promise.all([
+      Attendance.find(query)
+        .populate("user", "name email ipAddress appName appVersion platform deviceModel osVersion lastLoginAt loginHistory callLogSyncEnabled")
+        .sort({ date: -1, createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(Number(limit))
+        .lean(),
+      Attendance.countDocuments(query),
+      Company.findById(companyId).select("attendanceConfig").lean(),
+    ]);
+    const shiftCfg = companyCfg?.attendanceConfig || null;
+
+    // Enrich each record with CRM status
+    const enriched = records.map(rec => ({
+      ...rec,
+      derivedCrmStatus : deriveCrmStatus(rec, shiftCfg),
+      workingHours     : formatWorkHours(rec.totalWorkMinutes),
+      idleMinutes      : calcIdleMinutes(rec.breaks),
+      // FIX: idleTime must NEVER fall back to rec.idealTime. "Idle Time" is
+      // the auto-computed duration of inactivity (Auto Idle gaps); "Ideal
+      // Time" is the employee's self-declared planned shift window (e.g.
+      // "10:00 AM - 6:00 PM") — two unrelated fields that happen to have
+      // similar names. The old fallback showed the employee's planned shift
+      // text in the "Idle Time" column (styled as auto-idle data) whenever
+      // they hadn't actually gone idle that day, which is the common case —
+      // making it look like their stated hours were flagged as idle/slacking
+      // time. idealTime is already returned as its own field for the
+      // separate "Ideal Time" column.
+      idleTime         : (() => {
+        const idle = calcIdleMinutes(rec.breaks);
+        return idle > 0 ? formatWorkHours(idle) : "—";
+      })(),
+      manualBreakMinutes : calcManualBreakMinutes(rec.breaks),
+      // Idle periods the employee skipped without a reason — surfaced to
+      // admins so it's visible at a glance which idle gaps still need
+      // following up on, instead of only being visible to the employee
+      // themself the next time they go idle.
+      pendingIdleRemarks : (rec.breaks || []).filter(
+        b => b.reason === "Auto Idle" && b.remarkStatus === "pending"
+      ).length,
+    }));
+
+    // Filter by crmStatus after derivation (can't do in DB query for derived field)
+    const filtered = crmStatus
+      ? enriched.filter(r => r.derivedCrmStatus === crmStatus)
+      : enriched;
+
+    // Get users for absent rows — scoped the same way as the main query
+    const absentUserQuery = { company: companyId };
+    if (allowedUserIds) absentUserQuery._id = { $in: allowedUserIds };
+    const allUsers = await User.find(absentUserQuery).select("name email ipAddress").lean();
+
+    // Build absent rows: users with no record in range who have no record for today
+    let absentRows = [];
+    if (!userId && (!crmStatus || crmStatus === "absent")) {
+      const recordedUserIds = new Set(records.map(r => String(r.user?._id || r.user)));
+      // For single-day requests, mark users with no record as absent
+      if (from === to) {
+        absentRows = allUsers
+          .filter(u => !recordedUserIds.has(String(u._id)))
+          .map(u => ({
+            _id: null, user: u, date: from,
+            loginTime: null, logoutTime: null,
+            totalWorkMinutes: 0, totalBreakMinutes: 0,
+            status: "not_logged_in", derivedCrmStatus: "absent",
+            workingHours: "0h 00m", breaks: [], remarks: "",
+          }));
+      }
+    }
+
+    res.status(200).json({
+      records : [...filtered, ...absentRows],
+      total   : total + absentRows.length,
+      page    : Number(page),
+      pages   : Math.ceil((total + absentRows.length) / limit),
+    });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// ── ADMIN: Edit attendance record ─────────────────────────────────────────────
+const editAttendance = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { loginTime, logoutTime, crmStatus, remarks, idealTime, idealRemark } = req.body;
+
+    const record = await Attendance.findById(id);
+    if (!record) return res.status(404).json({ message: "Record not found." });
+
+    // Verify it belongs to this company
+    if (String(record.company) !== String(req.admin.company._id))
+      return res.status(403).json({ message: "Forbidden." });
+
+    if (loginTime  !== undefined) record.loginTime  = loginTime  ? new Date(loginTime)  : null;
+    if (logoutTime !== undefined) record.logoutTime = logoutTime ? new Date(logoutTime) : null;
+    if (crmStatus  !== undefined) record.crmStatus  = crmStatus;
+    if (remarks    !== undefined) record.remarks    = remarks;
+    if (idealTime   !== undefined) record.idealTime   = String(idealTime).slice(0, 120);
+    if (idealRemark !== undefined) record.idealRemark = String(idealRemark).slice(0, 500);
+
+    // Recalculate work minutes if both times are present
+    if (record.loginTime && record.logoutTime) {
+      const elapsed             = Math.round((record.logoutTime - record.loginTime) / 60000);
+      record.totalBreakMinutes  = calcBreakMinutes(record.breaks);
+      record.totalWorkMinutes   = Math.max(0, elapsed - record.totalBreakMinutes);
+      if (record.status !== "logged_out") record.status = "logged_out";
+    }
+
+    await record.save();
+    res.status(200).json(record);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// ── Admin: create OR update attendance for an employee+date ───────────────────
+// Used when an employee has no record for the day yet (an "Absent" /
+// not-logged-in synthetic row). Upserts by { company, user, date } so admins
+// can set status, login/logout, ideal time and remarks for anyone.
+const adminUpsertAttendance = async (req, res) => {
+  try {
+    const { user, date, loginTime, logoutTime, crmStatus, remarks, idealTime, idealRemark } = req.body;
+    if (!user || !date) {
+      return res.status(400).json({ message: "user and date are required." });
+    }
+
+    const companyId = req.admin.company._id;
+
+    // Confirm the target user belongs to this company.
+    const target = await User.findOne({ _id: user, company: companyId }).select("_id").lean();
+    if (!target) return res.status(403).json({ message: "Forbidden." });
+
+    let record = await Attendance.findOne({ company: companyId, user, date });
+    if (!record) {
+      record = new Attendance({ company: companyId, user, date, status: "not_logged_in", breaks: [] });
+    }
+
+    if (loginTime  !== undefined) record.loginTime  = loginTime  ? new Date(loginTime)  : null;
+    if (logoutTime !== undefined) record.logoutTime = logoutTime ? new Date(logoutTime) : null;
+    if (crmStatus  !== undefined) record.crmStatus  = crmStatus;
+    if (remarks    !== undefined) record.remarks    = remarks;
+    if (idealTime   !== undefined) record.idealTime   = String(idealTime).slice(0, 120);
+    if (idealRemark !== undefined) record.idealRemark = String(idealRemark).slice(0, 500);
+
+    if (record.loginTime && record.logoutTime) {
+      const elapsed            = Math.round((record.logoutTime - record.loginTime) / 60000);
+      record.totalBreakMinutes = calcBreakMinutes(record.breaks);
+      record.totalWorkMinutes  = Math.max(0, elapsed - record.totalBreakMinutes);
+      record.status            = "logged_out";
+    }
+
+    await record.save();
+    res.status(200).json(record);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// ── ADMIN: Delete attendance record ──────────────────────────────────────────
+const deleteAttendance = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const record = await Attendance.findById(id);
+    if (!record) return res.status(404).json({ message: "Record not found." });
+
+    if (String(record.company) !== String(req.admin.company._id))
+      return res.status(403).json({ message: "Forbidden." });
+
+    await record.deleteOne();
+    res.status(200).json({ message: "Deleted." });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// ── ADMIN: Export attendance data (returns JSON — frontend builds xlsx) ────────
+const exportAttendance = async (req, res) => {
+  try {
+    const companyId = req.admin.company._id;
+    const { startDate, endDate, userId, crmStatus } = req.query;
+
+    const today = todayStr();
+    const from  = startDate || today;
+    const to    = endDate   || today;
+
+    // Scope: super_admin sees all; regular admin sees only their users
+    let exportAllowedIds = null;
+    if (req.admin.role !== "super_admin") {
+      const scopedUsers = await User.find({ company: companyId, createdBy: req.admin._id }).select("_id").lean();
+      exportAllowedIds = scopedUsers.map(u => u._id);
+    }
+
+    const query = { company: companyId, date: { $gte: from, $lte: to } };
+    if (userId) {
+      if (exportAllowedIds && !exportAllowedIds.some(id => String(id) === String(userId))) {
+        return res.status(200).json([]);
+      }
+      query.user = userId;
+    } else if (exportAllowedIds) {
+      query.user = { $in: exportAllowedIds };
+    }
+
+    const [records, companyCfg2] = await Promise.all([
+      Attendance.find(query)
+        .populate("user", "name email ipAddress")
+        .sort({ date: -1 })
+        .lean(),
+      Company.findById(companyId).select("attendanceConfig").lean(),
+    ]);
+    const exportShiftCfg = companyCfg2?.attendanceConfig || null;
+
+    let enriched = records.map(rec => ({
+      employeeName : rec.user?.name || "Unknown",
+      email        : rec.user?.email || "",
+      date         : rec.date,
+      // FIX (clock/timezone bug): the "en-IN" locale only controls the
+      // 12-hour/AM-PM *format* — it does NOT force IST. Without an explicit
+      // timeZone, this rendered in the server process's local timezone,
+      // which can silently disagree with what the live app screens show.
+      checkIn      : rec.loginTime  ? new Date(rec.loginTime).toLocaleTimeString("en-IN",  { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" }) : "—",
+      checkOut     : rec.logoutTime ? new Date(rec.logoutTime).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" }) : "—",
+      workingHours : formatWorkHours(rec.totalWorkMinutes),
+      breakMinutes : calcManualBreakMinutes(rec.breaks),
+      // FIX: "Idle Time" (auto-computed Auto-Idle gaps) must not fall back to
+      // idealTime (the employee's self-declared planned shift text) — these
+      // are unrelated fields. idealTime/idealRemark are already exported as
+      // their own columns below, so this export was duplicating the same
+      // text into "Idle Time" too whenever there was no real idle gap.
+      idleMinutes  : calcIdleMinutes(rec.breaks),
+      idleTime     : (() => {
+        const idle = calcIdleMinutes(rec.breaks);
+        return idle > 0 ? formatWorkHours(idle) : "—";
+      })(),
+      status       : deriveCrmStatus(rec, exportShiftCfg),
+      remarks      : rec.remarks || "",
+      idealTime    : rec.idealTime || "",
+      idealRemark  : rec.idealRemark || "",
+    }));
+
+    if (crmStatus) enriched = enriched.filter(r => r.status === crmStatus);
+
+    res.status(200).json(enriched);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// ── ADMIN: Get company users list (for employee filter dropdown) ───────────────
+const getCompanyUsers = async (req, res) => {
+  try {
+    // Scope: super_admin sees all users; regular admin sees only their own users
+    const userQuery = { company: req.admin.company._id };
+    if (req.admin.role !== "super_admin") {
+      userQuery.createdBy = req.admin._id;
+    }
+    const users = await User.find(userQuery)
+      .select("name email ipAddress appName appVersion platform deviceModel osVersion lastLoginAt loginHistory createdAt").lean();
+    res.status(200).json(users);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+};
+
+// Helper
+function formatWorkHours(mins) {
+  if (!mins) return "0h 00m";
+  return `${Math.floor(mins / 60)}h ${(mins % 60).toString().padStart(2, "0")}m`;
+}
+
+// ── POST /attendance/request-meeting-permission ───────────────────────────────
+// Employee requests remote clock-in (client meeting).
+// Stores the request on the User document and emits a socket event to the admin.
+const requestMeetingPermission = async (req, res) => {
+  try {
+    const userId    = req.user._id;
+    const companyId = req.user.company;
+    const { reason, location } = req.body;
+
+    // Store the pending request on the user document
+    const user = await User.findByIdAndUpdate(
+      userId,
+      {
+        $set: {
+          meetingPermissionRequested:   true,
+          meetingPermissionRequestedAt: new Date(),
+          meetingPermissionReason:      (reason || '').trim(),
+          meetingPermissionLocation:    (location || '').trim(),
+          meetingPermissionStatus:      'pending',
+        },
+      },
+      { new: true }
+    ).select('name email clientMeetingPermission meetingPermissionStatus createdBy');
+
+    // Emit socket notification to admin
+    const _io = global._io;
+    if (_io) {
+      const adminId = user.createdBy || null;
+      const payload = {
+        userId:    String(userId),
+        userName:  user.name,
+        reason:    (reason || '').trim(),
+        location:  (location || '').trim(),
+        requestedAt: new Date().toISOString(),
+      };
+      if (adminId) {
+        _io.to(`admin_room:${String(adminId)}`).emit('meeting_permission_requested', payload);
+      }
+      // Also emit to company-wide admin room so any online admin sees it
+      _io.to(`company_admin:${String(companyId)}`).emit('meeting_permission_requested', payload);
+    }
+
+    res.json({ message: 'Request sent to admin. You will be notified once approved.', status: 'pending' });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// ── GET /attendance/meeting-permission-status ─────────────────────────────────
+// Employee polls their permission status (approved / pending / denied)
+const getMeetingPermissionStatus = async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id)
+      .select('clientMeetingPermission clientMeetingPermissionGrantedAt meetingPermissionStatus meetingPermissionRequested')
+      .lean();
+
+    const isActive = (() => {
+      if (!user.clientMeetingPermission) return false;
+      if (!user.clientMeetingPermissionGrantedAt) return false;
+      return (Date.now() - new Date(user.clientMeetingPermissionGrantedAt).getTime()) < 24 * 60 * 60 * 1000;
+    })();
+
+    res.json({
+      hasPermission: isActive,
+      grantedAt:     user.clientMeetingPermissionGrantedAt || null,
+      status:        isActive ? 'approved' : (user.meetingPermissionStatus || 'none'),
+      isPending:     user.meetingPermissionRequested && user.meetingPermissionStatus === 'pending',
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// ── POST /attendance/location-ping ───────────────────────────────────────────
+// Mobile app sends periodic GPS pings while employee has clientMeetingPermission.
+// Requires employee's explicit location consent (app already requested permission).
+// Silently rejects if:
+//   - company.meetingLocationTrackingEnabled is false
+//   - employee does not have active (< 24h) clientMeetingPermission
+const locationPing = async (req, res) => {
+  try {
+    const userId    = req.user._id;
+    const companyId = req.user.company;
+    const { latitude, longitude, accuracy, address } = req.body;
+
+    if (latitude == null || longitude == null) {
+      return res.status(400).json({ message: 'latitude and longitude required' });
+    }
+
+    // Check company tracking toggle
+    const company = await Company.findById(companyId)
+      .select('meetingLocationTrackingEnabled')
+      .lean();
+    if (!company?.meetingLocationTrackingEnabled) {
+      return res.json({ stored: false, reason: 'tracking_disabled' });
+    }
+
+    // Authorize the ping. clockIn consumes clientMeetingPermission the instant
+    // it's used, so a remote session's later pings can't rely on it — we check
+    // the per-day remoteClockIn flag on today's Attendance instead. The user
+    // permission check is kept as a fallback (e.g. permission granted mid-session
+    // before the next clock-in).
+    const attToday = await Attendance.findOne({ user: userId, date: todayStr() })
+      .select('remoteClockIn loginTime logoutTime')
+      .lean();
+    const inRemoteSession = !!(attToday && attToday.remoteClockIn && attToday.loginTime && !attToday.logoutTime);
+
+    const userDoc = await User.findById(userId)
+      .select('clientMeetingPermission clientMeetingPermissionGrantedAt')
+      .lean();
+    const hasActivePermission = (() => {
+      if (!userDoc?.clientMeetingPermission) return false;
+      if (!userDoc.clientMeetingPermissionGrantedAt) return false;
+      return (Date.now() - new Date(userDoc.clientMeetingPermissionGrantedAt).getTime()) < 24 * 60 * 60 * 1000;
+    })();
+
+    if (!inRemoteSession && !hasActivePermission) {
+      return res.json({ stored: false, reason: 'no_meeting_permission' });
+    }
+
+    const ping = await LiveLocation.create({
+      user:      userId,
+      company:   companyId,
+      latitude:  Number(latitude),
+      longitude: Number(longitude),
+      accuracy:  accuracy != null ? Number(accuracy) : null,
+      address:   (address || '').trim() || null,
+      date:      todayStr(),
+      context:   'meeting',
+      capturedAt: new Date(),
+    });
+
+    // Emit to admin room so live map updates in real-time (optional enhancement)
+    const _io = global._io;
+    if (_io) {
+      _io.to(`company_admin:${String(companyId)}`).emit('employee_location_ping', {
+        userId:    String(userId),
+        userName:  req.user.name,
+        latitude:  ping.latitude,
+        longitude: ping.longitude,
+        address:   ping.address,
+        capturedAt: ping.capturedAt,
+      });
+    }
+
+    res.json({ stored: true, pingId: ping._id });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// ── GET /attendance/live-locations ────────────────────────────────────────────
+// Admin/superadmin fetches today's location trail for all employees with
+// meeting permission. Returns the last N pings per employee.
+const getLiveLocations = async (req, res) => {
+  try {
+    const companyId = req.admin?.company?._id || req.admin?.company;
+    const date      = todayStr();
+    const limit     = Math.min(200, parseInt(req.query.limit || '50', 10));
+    const userId    = req.query.userId || null; // optional filter by employee
+
+    const query = { company: companyId, date };
+    if (userId) query.user = userId;
+
+    const pings = await LiveLocation.find(query)
+      .sort({ capturedAt: -1 })
+      .limit(limit)
+      .populate('user', 'name email')
+      .lean();
+
+    res.json({ pings, date, total: pings.length });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// ── GET /attendance/meeting-tracking-config ────────────────────────────────────
+// Employee fetches current tracking settings (enabled + interval) on clock-in
+// ── GET /attendance/geofence-config ───────────────────────────────────────────
+// Returns the company's office geofence so the mobile app can detect when a
+// clocked-in employee LEAVES the premises and auto-start field-work location
+// tracking. Also returns the tracking interval so breadcrumb frequency matches
+// the meeting-tracking setting. Safe to expose to employees (no secrets).
+const getGeofenceConfig = async (req, res) => {
+  try {
+    const company = await Company.findById(req.user.company)
+      .select('clockInLocationEnabled clockInLatitude clockInLongitude clockInRadiusMeters meetingLocationIntervalMinutes')
+      .lean();
+    res.json({
+      enabled:         !!(company?.clockInLocationEnabled && company?.clockInLatitude && company?.clockInLongitude),
+      latitude:        company?.clockInLatitude ?? null,
+      longitude:       company?.clockInLongitude ?? null,
+      radiusMeters:    100, // office geofence radius is fixed at 100m
+      intervalMinutes: company?.meetingLocationIntervalMinutes || 15,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+const getMeetingTrackingConfig = async (req, res) => {
+  try {
+    const company = await Company.findById(req.user.company)
+      .select('meetingLocationTrackingEnabled meetingLocationIntervalMinutes')
+      .lean();
+    res.json({
+      enabled:          company?.meetingLocationTrackingEnabled || false,
+      intervalMinutes:  company?.meetingLocationIntervalMinutes || 15,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// ── PUT /admin/company/meeting-tracking ───────────────────────────────────────
+// Admin sets the meeting location tracking toggle + interval
+const saveMeetingTrackingConfig = async (req, res) => {
+  try {
+    const companyId = req.admin?.company?._id || req.admin?.company;
+    const { enabled, intervalMinutes } = req.body;
+    const update = {};
+    if (enabled !== undefined) update.meetingLocationTrackingEnabled = Boolean(enabled);
+    if (intervalMinutes != null) {
+      const mins = Math.max(5, Math.min(60, parseInt(intervalMinutes, 10)));
+      update.meetingLocationIntervalMinutes = mins;
+    }
+    await Company.findByIdAndUpdate(companyId, { $set: update });
+    res.json({ message: 'Meeting tracking config saved.', ...update });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// ── ADMIN: permanent clock-in/out location history ───────────────────────────
+// GET /attendance/location-history?userId=&from=&to=&type=&page=&limit=
+// Reads the append-only ClockLocationLog (never expires), scoped like the
+// attendance report: super_admin sees all users; a regular admin sees only the
+// users they created.
+const getClockLocationHistory = async (req, res) => {
+  try {
+    const companyId = req.admin?.company?._id || req.admin?.company;
+    const { userId, from, to, type, page = 1, limit = 100 } = req.query;
+
+    const query = { company: companyId };
+    if (from || to) {
+      query.date = {};
+      if (from) query.date.$gte = from;
+      if (to)   query.date.$lte = to;
+    }
+    if (type === "clock_in" || type === "clock_out") query.type = type;
+
+    // Scope non-super-admins to their own users.
+    if (req.admin.role !== "super_admin") {
+      const scoped = await User.find({ company: companyId, createdBy: req.admin._id }).select("_id").lean();
+      const allowed = scoped.map((u) => String(u._id));
+      if (userId) {
+        if (!allowed.includes(String(userId))) return res.json({ records: [], total: 0, page: 1, pages: 1 });
+        query.user = userId;
+      } else {
+        query.user = { $in: scoped.map((u) => u._id) };
+      }
+    } else if (userId) {
+      query.user = userId;
+    }
+
+    const lim = Math.min(Number(limit) || 100, 500);
+    const [records, total] = await Promise.all([
+      ClockLocationLog.find(query)
+        .populate("user", "name email")
+        .sort({ capturedAt: -1 })
+        .skip((Number(page) - 1) * lim)
+        .limit(lim)
+        .lean(),
+      ClockLocationLog.countDocuments(query),
+    ]);
+
+    res.json({ records, total, page: Number(page), pages: Math.ceil(total / lim) || 1 });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+module.exports = {
+  clockIn, clockOut, startBreak, endBreak, pingActivity, getMyToday,
+  getShiftConfig,
+  saveIdleRemark,
+  getCompanyAttendance, markIdleUsers,
+  adminUpsertAttendance,
+  getAttendanceReport, editAttendance, deleteAttendance, exportAttendance,
+  getCompanyUsers,
+  requestMeetingPermission,
+  getMeetingPermissionStatus,
+  locationPing,
+  getLiveLocations,
+  getMeetingTrackingConfig,
+  getGeofenceConfig,
+  saveMeetingTrackingConfig,
+  getClockLocationHistory,
+};

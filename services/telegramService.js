@@ -1,0 +1,420 @@
+// services/telegramService.js
+// ─────────────────────────────────────────────────────────────────────────────
+// CAMPAIGN-ONLY TELEGRAM NOTIFICATION SERVICE
+//
+// Business rule: Telegram notifications are sent EXCLUSIVELY for leads
+// generated through campaign sources (Meta, Google Ads, Website, etc.).
+// Manual entries, CSV imports, bulk uploads — never notified.
+//
+// Campaign sources (lead.source values that qualify):
+//   "Meta"       → Facebook / Instagram Lead Ads (metaWebhookController)
+//   "Google Ads" → Google Lead Form Extension (googleAdsHelper)
+//   "Website"    → Landing page / website form (websiteWebhookController)
+//
+// Usage:
+//   const { notifyCampaignLead } = require('../services/telegramService');
+//   await notifyCampaignLead(lead, companyId);   // only fires for campaign sources
+//
+// Config stored on Company document:
+//   telegramBotToken    — Telegram Bot API token (stored encrypted-at-rest in DB)
+//   telegramChatId      — Group chat ID or personal chat ID for notifications
+//   telegramEnabled     — master on/off switch
+// ─────────────────────────────────────────────────────────────────────────────
+
+const https    = require('https');
+const Company  = require('../models/Company');
+const User     = require('../models/Users');
+
+// ── Plan entitlement gate ─────────────────────────────────────────────────────
+// Telegram notifications require the "telegramNotification" feature, which is
+// granted on Pro / Advance / Enterprise plans. Even if a company has toggled
+// telegram on and configured a bot, we never send unless the plan allows it.
+// Fails OPEN only if the entitlement service itself errors (so a transient DB
+// issue never silently kills notifications for paying customers).
+async function telegramEntitled(companyId) {
+  try {
+    const { getCompanyEntitlements } = require('./entitlementService');
+    const ent = await getCompanyEntitlements(companyId);
+    if (!ent) return true; // unknown → don't block
+    // Respect explicit false; treat undefined as allowed for backward compat.
+    return ent.telegramNotification !== false;
+  } catch (e) {
+    console.warn('[Telegram] entitlement check failed, allowing send:', e.message);
+    return true;
+  }
+}
+
+// ── Campaign source whitelist ─────────────────────────────────────────────────
+// These are the ONLY lead.source values that trigger Telegram notifications.
+// All other sources (Web Form, Excel Import, CSV Import, etc.) are silently skipped.
+const CAMPAIGN_SOURCES = new Set([
+  'Meta',          // Facebook + Instagram Lead Ads (metaWebhookController)
+  'Google Ads',    // Google Lead Form Extension (googleAdsHelper)
+  'Website',       // Landing page / website tracking (websiteWebhookController)
+]);
+
+// ── Platform label for notification message ───────────────────────────────────
+function platformLabel(source) {
+  if (source === 'Meta')       return 'Meta (Facebook/Instagram)';
+  if (source === 'Google Ads') return 'Google Ads';
+  if (source === 'Website')    return 'Website/Landing Page';
+  return source;
+}
+
+// ── Check if a lead qualifies for Telegram notification ──────────────────────
+// Performance optimization: returns false early for non-campaign leads
+// so we never even fetch the Telegram config from DB.
+function isCampaignLead(lead) {
+  if (!lead) return false;
+  // Explicit sourceType field (future-proof)
+  if (lead.sourceType === 'campaign') return true;
+  // Source value check (current system)
+  if (lead.source && CAMPAIGN_SOURCES.has(lead.source)) return true;
+  return false;
+}
+
+// ── Low-level: send a message via Telegram Bot API ───────────────────────────
+// Returns { ok: true } on success, throws on failure.
+function sendTelegramMessage(botToken, chatId, text) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      chat_id:    chatId,
+      text,
+      parse_mode: 'HTML',
+    });
+
+    const options = {
+      hostname: 'api.telegram.org',
+      path:     `/bot${botToken}/sendMessage`,
+      method:   'POST',
+      headers:  {
+        'Content-Type':   'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.ok) {
+            resolve(parsed);
+          } else {
+            reject(new Error(`Telegram API error: ${parsed.description || JSON.stringify(parsed)}`));
+          }
+        } catch {
+          reject(new Error(`Invalid Telegram response: ${data}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(new Error('Telegram request timeout')); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── Build the notification message ───────────────────────────────────────────
+async function buildMessage(lead, companyName) {
+  // Resolve assigned employee name
+  let assignedTo = 'Unassigned';
+  if (lead.user) {
+    try {
+      const userId = lead.user?._id || lead.user;
+      const user   = await User.findById(userId).select('name').lean();
+      if (user?.name) assignedTo = user.name;
+    } catch { /* non-fatal */ }
+  }
+
+  const now = new Date().toLocaleString('en-IN', {
+    timeZone:   'Asia/Kolkata',
+    day:        '2-digit',
+    month:      'short',
+    year:       'numeric',
+    hour:       '2-digit',
+    minute:     '2-digit',
+    hour12:     true,
+  });
+
+  const phone    = lead.primaryPhone || lead.mobile || '—';
+  const campaign = lead.campaign     || '—';
+  const platform = platformLabel(lead.source);
+
+  return (
+    `🆕 <b>New Campaign Lead</b>\n\n` +
+    `🏢 <b>Company:</b> ${escapeHtml(companyName)}\n` +
+    `👤 <b>Lead Name:</b> ${escapeHtml(lead.name || 'Unknown')}\n` +
+    `📞 <b>Phone:</b> <code>${escapeHtml(phone)}</code>\n` +
+    `📣 <b>Campaign:</b> ${escapeHtml(campaign)}\n` +
+    `🌐 <b>Platform:</b> ${escapeHtml(platform)}\n` +
+    `📋 <b>Source:</b> ${escapeHtml(lead.source || '—')}\n` +
+    `👷 <b>Assigned To:</b> ${escapeHtml(assignedTo)}\n` +
+    `🕐 <b>Time:</b> ${now}`
+  );
+}
+
+// Minimal HTML escaping to avoid Telegram parse errors
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// ── Main exported function: notify for campaign leads only ───────────────────
+// This is the ONLY entry point other modules should use.
+//
+// Workflow:
+//   1. isCampaignLead?     → No  → return immediately (no DB hit)
+//   2. Fetch company config → no token or disabled → return
+//   3. Build message
+//   4. Send to Telegram
+//
+// Always resolves (never rejects) — errors are logged, never propagated
+// to avoid disrupting lead creation flow.
+async function notifyCampaignLead(lead, companyId) {
+  // ── Step 1: Campaign filter — exit fast for non-campaign leads ────────────
+  if (!isCampaignLead(lead)) return;
+
+  try {
+    // ── Step 2: Fetch Telegram config for this company ────────────────────
+    if (!companyId) {
+      console.warn('[Telegram] notifyCampaignLead: no companyId provided');
+      return;
+    }
+
+    // Plan gate — Pro/Advance/Enterprise only
+    if (!(await telegramEntitled(companyId))) {
+      console.debug('[Telegram] Skipping — telegramNotification not in plan for this company');
+      return;
+    }
+
+    const company = await Company
+      .findById(companyId)
+      .select('name telegramBotToken telegramChatId telegramEnabled')
+      .lean();
+
+    if (!company) {
+      console.warn(`[Telegram] Company ${companyId} not found`);
+      return;
+    }
+
+    if (!company.telegramEnabled) return;
+    if (!company.telegramBotToken || !company.telegramChatId) {
+      console.debug(`[Telegram] Skipping — token or chatId not configured for "${company.name}"`);
+      return;
+    }
+
+    // ── Step 3: Build message ─────────────────────────────────────────────
+    const text = await buildMessage(lead, company.name);
+
+    // ── Step 4: Send ──────────────────────────────────────────────────────
+    await sendTelegramMessage(company.telegramBotToken, company.telegramChatId, text);
+    console.log(`[Telegram] ✅ Campaign lead notification sent for "${lead.name}" → company "${company.name}"`);
+
+  } catch (err) {
+    // Never crash lead creation because of a notification failure
+    console.error('[Telegram] notifyCampaignLead error:', err.message);
+  }
+}
+
+// ── Test: send a test message (called from admin settings) ───────────────────
+// Resolves with { ok: true } or rejects with a user-friendly error.
+async function sendTestNotification(botToken, chatId, companyName) {
+  const text =
+    `✅ <b>Telegram Connected!</b>\n\n` +
+    `Your Telegram notifications are now active for <b>${escapeHtml(companyName)}</b>.\n\n` +
+    `Campaign leads (Meta, Google Ads, Website) will be sent to this chat.`;
+
+  await sendTelegramMessage(botToken, chatId, text);
+  return { ok: true };
+}
+
+// ── Build employee assignment message ─────────────────────────────────────────
+function buildEmployeeMessage(lead, employeeName) {
+  const now = new Date().toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    day:      '2-digit', month: 'short', year: 'numeric',
+    hour:     '2-digit', minute: '2-digit', hour12: true,
+  });
+
+  const phone   = lead.primaryPhone || lead.mobile || '—';
+  const source  = lead.source   || '—';
+  const status  = lead.status   || 'New';
+  const quality = lead.temperature || lead.Quality || '—';
+
+  return (
+    `📋 <b>New Lead Assigned to You</b>\n\n` +
+    `👤 <b>Lead Name:</b> ${escapeHtml(lead.name || 'Unknown')}\n` +
+    `📞 <b>Phone:</b> <code>${escapeHtml(phone)}</code>\n` +
+    `📋 <b>Source:</b> ${escapeHtml(source)}\n` +
+    `🔥 <b>Quality:</b> ${escapeHtml(quality)}\n` +
+    `📌 <b>Status:</b> ${escapeHtml(status)}\n` +
+    `👷 <b>Assigned To:</b> ${escapeHtml(employeeName)}\n` +
+    `🕐 <b>Time:</b> ${now}`
+  );
+}
+
+// ── Notify employee on their personal Telegram chat when a lead is assigned ───
+// Uses the employee's own telegramChatId (stored on User document).
+// Uses the company's bot token (stored on Company document).
+// Both must be configured; silently skips if either is missing.
+//
+// Usage:
+//   const { notifyEmployeeLead } = require('../services/telegramService');
+//   await notifyEmployeeLead(userId, lead, companyId);
+async function notifyEmployeeLead(userId, lead, companyId) {
+  if (!userId || !lead || !companyId) return;
+
+  try {
+    // Plan gate — Pro/Advance/Enterprise only
+    if (!(await telegramEntitled(companyId))) return;
+
+    // Fetch employee's personal chat ID
+    const employee = await User.findById(userId)
+      .select('name telegramChatId')
+      .lean();
+
+    if (!employee?.telegramChatId) return; // not configured — skip silently
+
+    // Fetch company bot token
+    const company = await Company.findById(companyId)
+      .select('telegramBotToken telegramEnabled')
+      .lean();
+
+    if (!company?.telegramEnabled)  return;
+    if (!company?.telegramBotToken) return;
+
+    const text = buildEmployeeMessage(lead, employee.name);
+    await sendTelegramMessage(company.telegramBotToken, employee.telegramChatId, text);
+    console.log(`[Telegram] ✅ Lead assignment notified → employee "${employee.name}"`);
+
+  } catch (err) {
+    // Never crash lead assignment because of a Telegram failure
+    console.error('[Telegram] notifyEmployeeLead error:', err.message);
+  }
+}
+
+// ── Build admin campaign lead message ────────────────────────────────────────
+// Slightly different from the company-level message — shows admin context.
+function buildAdminCampaignMessage(lead, adminName, companyName) {
+  const now = new Date().toLocaleString('en-IN', {
+    timeZone:   'Asia/Kolkata',
+    day:        '2-digit',
+    month:      'short',
+    year:       'numeric',
+    hour:       '2-digit',
+    minute:     '2-digit',
+    hour12:     true,
+  });
+
+  const phone    = lead.primaryPhone || lead.mobile || '—';
+  const campaign = lead.campaign     || '—';
+  const platform = platformLabel(lead.source);
+
+  return (
+    `🆕 <b>New Campaign Lead</b>\n\n` +
+    `🏢 <b>Company:</b> ${escapeHtml(companyName)}\n` +
+    `👤 <b>Lead Name:</b> ${escapeHtml(lead.name || 'Unknown')}\n` +
+    `📞 <b>Phone:</b> <code>${escapeHtml(phone)}</code>\n` +
+    `📣 <b>Campaign:</b> ${escapeHtml(campaign)}\n` +
+    `🌐 <b>Platform:</b> ${escapeHtml(platform)}\n` +
+    `📋 <b>Source:</b> ${escapeHtml(lead.source || '—')}\n` +
+    `🕐 <b>Time:</b> ${now}\n\n` +
+    `<i>— Notified to: ${escapeHtml(adminName)}</i>`
+  );
+}
+
+// ── Notify a SINGLE admin on their personal Telegram chat for a campaign lead ─
+// Uses the admin's own telegramChatId + their telegramNotificationsEnabled flag.
+// Uses the company's shared bot token.
+// Silently skips if anything is missing/disabled.
+async function notifyAdminCampaignLead(adminId, lead, companyId) {
+  if (!adminId || !lead || !companyId) return;
+  if (!isCampaignLead(lead)) return;
+
+  try {
+    const Admin = require('../models/Admin');
+    const admin = await Admin.findById(adminId)
+      .select('name telegramChatId telegramNotificationsEnabled')
+      .lean();
+
+    if (!admin?.telegramChatId)                      return; // not configured
+    if (admin.telegramNotificationsEnabled === false) return; // opted out
+
+    const company = await Company.findById(companyId)
+      .select('name telegramBotToken telegramEnabled')
+      .lean();
+
+    if (!company?.telegramEnabled)  return;
+    if (!company?.telegramBotToken) return;
+
+    const text = buildAdminCampaignMessage(lead, admin.name, company.name);
+    await sendTelegramMessage(company.telegramBotToken, admin.telegramChatId, text);
+    console.log(`[Telegram] ✅ Campaign lead notified → admin "${admin.name}"`);
+  } catch (err) {
+    console.error('[Telegram] notifyAdminCampaignLead error:', err.message);
+  }
+}
+
+// ── Notify ALL admins of a company for a campaign lead ────────────────────────
+// Called after a campaign lead is created. Each admin with a configured
+// telegramChatId and telegramNotificationsEnabled=true receives a message.
+// Uses the company's shared bot token — one token, many admin chats.
+async function notifyAllAdminsCampaignLead(lead, companyId) {
+  if (!isCampaignLead(lead)) return;
+  if (!companyId) return;
+
+  try {
+    const company = await Company.findById(companyId)
+      .select('name telegramBotToken telegramEnabled')
+      .lean();
+
+    if (!company?.telegramEnabled)  return;
+    if (!company?.telegramBotToken) return;
+
+    const Admin = require('../models/Admin');
+    const admins = await Admin.find({
+      company: companyId,
+      // FIX: the previous filter was `{ $ne: null, $ne: '' }` — a JS object
+      // literal with a duplicate key, which silently collapses to just
+      // `{ $ne: '' }` (the `$ne: null` half is discarded, it never reaches
+      // Mongo at all). That let admins with no telegramChatId configured
+      // (null/undefined) pass the filter and get queued for a send that
+      // was guaranteed to fail against the Telegram API. $nin correctly
+      // excludes both null and empty string in one condition.
+      telegramChatId: { $nin: [null, ''] },
+      telegramNotificationsEnabled: { $ne: false },
+    }).select('name telegramChatId').lean();
+
+    if (!admins.length) return;
+
+    // Fire to all admins concurrently; individual failures don't block others
+    await Promise.allSettled(
+      admins.map(async (admin) => {
+        try {
+          const text = buildAdminCampaignMessage(lead, admin.name, company.name);
+          await sendTelegramMessage(company.telegramBotToken, admin.telegramChatId, text);
+          console.log(`[Telegram] ✅ Campaign lead notified → admin "${admin.name}"`);
+        } catch (e) {
+          console.error(`[Telegram] Failed to notify admin "${admin.name}":`, e.message);
+        }
+      })
+    );
+  } catch (err) {
+    console.error('[Telegram] notifyAllAdminsCampaignLead error:', err.message);
+  }
+}
+
+module.exports = {
+  notifyCampaignLead,
+  notifyEmployeeLead,
+  notifyAdminCampaignLead,
+  notifyAllAdminsCampaignLead,
+  sendTestNotification,
+  isCampaignLead,
+  CAMPAIGN_SOURCES,
+};
