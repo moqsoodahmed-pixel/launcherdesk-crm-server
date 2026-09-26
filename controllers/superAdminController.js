@@ -93,52 +93,57 @@ const loginSuperAdmin = async (req, res) => {
     if (!email || !password)
       return res.status(400).json({ message: "Email and password are required." });
 
-    let targetName = "", targetEmail = "", isAdmin = false;
-
+    // ── Path A: Admin model (new multi-tenant super admin) ───────────────────
     const adminDoc = await Admin.findOne({ email, role: "super_admin" }).populate("company");
     if (adminDoc && (await adminDoc.matchPassword(password))) {
-      targetName = adminDoc.name; targetEmail = adminDoc.email; isAdmin = true;
+      return res.json({
+        _id:         adminDoc._id,
+        name:        adminDoc.name,
+        email:       adminDoc.email,
+        role:        "super_admin",
+        company:     adminDoc.company,
+        companyId:   adminDoc.company?._id,
+        companyName: adminDoc.company?.name,
+        token:       generateToken(adminDoc._id, "super_admin"),
+      });
     }
 
-    if (!isAdmin) {
-      const legacyDoc = await SuperAdmin.findOne({ email });
-      if (legacyDoc && (await legacyDoc.matchPassword(password))) {
-        targetName = legacyDoc.name; targetEmail = legacyDoc.email;
-        if (legacyDoc.otpLockedUntil && legacyDoc.otpLockedUntil > new Date()) {
-          const mins = Math.ceil((legacyDoc.otpLockedUntil - Date.now()) / 60000);
-          return res.status(429).json({ message: `Too many failed OTP attempts. Try again in ${mins} minute(s).` });
-        }
+    // ── Path B: Legacy SuperAdmin model ───────────────────────────────────────
+    const legacyDoc = await SuperAdmin.findOne({ email });
+    if (legacyDoc && (await legacyDoc.matchPassword(password))) {
+      if (legacyDoc.otpLockedUntil && legacyDoc.otpLockedUntil > new Date()) {
+        const mins = Math.ceil((legacyDoc.otpLockedUntil - Date.now()) / 60000);
+        return res.status(429).json({ message: `Too many failed attempts. Try again in ${mins} minute(s).` });
       }
+
+      // Same company lookup the old OTP step used to do, so the chat widget
+      // and company-scoped views still work for legacy accounts.
+      const migratedAdmin = await Admin.findOne({ email }).populate("company");
+      const companyObj    = migratedAdmin?.company || null;
+      const companyId     = companyObj?._id || null;
+      const companyName   = companyObj?.name || "";
+
+      if (!companyId) {
+        console.warn(
+          "[loginSuperAdmin] Legacy super admin has no Admin record / company — chat will be empty.",
+          "email=", email
+        );
+      }
+
+      return res.json({
+        _id:         legacyDoc._id,
+        name:        legacyDoc.name,
+        email:       legacyDoc.email,
+        role:        "super_admin",
+        company:     companyObj,
+        companyId:   companyId,
+        companyName: companyName,
+        token:       generateToken(legacyDoc._id, "super_admin"),
+      });
     }
 
-    if (!targetEmail) return res.status(401).json({ message: "Invalid email or password." });
-
-    const plainOtp  = generateOtp();
-    const hashedOtp = await bcrypt.hash(plainOtp, 10);
-    const otpExpiry = new Date(Date.now() + OTP_EXPIRY_MIN * 60 * 1000);
-
-    await SuperAdmin.findOneAndUpdate(
-      { email: targetEmail },
-      {
-        $set: {
-          name: targetName, email: targetEmail,
-          otp: hashedOtp, otpExpiry,
-          otpAttempts: 0, otpLockedUntil: null,
-        },
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-
-    const { delivered } = await deliverSuperAdminOtp({ toEmail: targetEmail, toName: targetName, otp: plainOtp });
-
-    res.json({
-      success: true,
-      message: delivered
-        ? `OTP sent to ${targetEmail}. Valid for ${OTP_EXPIRY_MIN} minutes.`
-        : `Email delivery is unavailable — your OTP has been written to the server logs. Valid for ${OTP_EXPIRY_MIN} minutes.`,
-      email:   targetEmail,
-    });
-  } catch (error) { res.status(error.statusCode || 500).json({ message: error.message }); }
+    return res.status(401).json({ message: "Invalid email or password." });
+  } catch (error) { res.status(500).json({ message: error.message }); }
 };
 
 const verifySuperAdminOtp = async (req, res) => {
