@@ -26,6 +26,39 @@ const OTP_EXPIRY_MIN = 10;
 const MAX_ATTEMPTS   = 3;
 const LOCK_MIN       = 15;
 
+// ── OTP delivery with a clear failure path ───────────────────────────────────
+// Brevo errors used to surface as a bare "Request failed with status code 401"
+// 500. Now the real Brevo reason is logged, the client gets a readable message,
+// and an opt-in break-glass lets the owner read the OTP from the server logs
+// (Railway → Deployments → Logs) while email is being fixed.
+//
+//   SUPERADMIN_OTP_LOG_FALLBACK=true   → on email failure, log the OTP and let
+//                                        the sign-in continue. Turn it OFF again
+//                                        once Brevo works.
+const deliverSuperAdminOtp = async ({ toEmail, toName, otp }) => {
+  try {
+    await sendSuperAdminOtp({ toEmail, toName, otp });
+    return { delivered: true };
+  } catch (err) {
+    const status = err.response?.status;
+    const detail = err.response?.data?.message || err.response?.data?.code || err.message;
+    console.error(`[SuperAdmin OTP] Brevo email failed (status ${status || "n/a"}): ${detail}`);
+
+    if (process.env.SUPERADMIN_OTP_LOG_FALLBACK === "true") {
+      console.warn(`[SuperAdmin OTP] FALLBACK ACTIVE — OTP for ${toEmail}: ${otp} (valid ${OTP_EXPIRY_MIN} min)`);
+      return { delivered: false };
+    }
+
+    const e = new Error(
+      status === 401
+        ? "OTP email could not be sent: the Brevo API key was rejected. Update BREVO_API_KEY on the server (or check Brevo's Authorized IPs)."
+        : `OTP email could not be sent: ${detail}`
+    );
+    e.statusCode = 502;
+    throw e;
+  }
+};
+
 function generateOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
@@ -96,14 +129,16 @@ const loginSuperAdmin = async (req, res) => {
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
-    await sendSuperAdminOtp({ toEmail: targetEmail, toName: targetName, otp: plainOtp });
+    const { delivered } = await deliverSuperAdminOtp({ toEmail: targetEmail, toName: targetName, otp: plainOtp });
 
     res.json({
       success: true,
-      message: `OTP sent to ${targetEmail}. Valid for ${OTP_EXPIRY_MIN} minutes.`,
+      message: delivered
+        ? `OTP sent to ${targetEmail}. Valid for ${OTP_EXPIRY_MIN} minutes.`
+        : `Email delivery is unavailable — your OTP has been written to the server logs. Valid for ${OTP_EXPIRY_MIN} minutes.`,
       email:   targetEmail,
     });
-  } catch (error) { res.status(500).json({ message: error.message }); }
+  } catch (error) { res.status(error.statusCode || 500).json({ message: error.message }); }
 };
 
 const verifySuperAdminOtp = async (req, res) => {
@@ -220,10 +255,13 @@ const resendSuperAdminOtp = async (req, res) => {
       $set: { otp: hashedOtp, otpExpiry, otpAttempts: 0 },
     });
 
-    await sendSuperAdminOtp({ toEmail: email, toName: shadowDoc.name || "Admin", otp: plainOtp });
+    const { delivered } = await deliverSuperAdminOtp({ toEmail: email, toName: shadowDoc.name || "Admin", otp: plainOtp });
 
-    res.json({ success: true, message: `OTP resent to ${email}.` });
-  } catch (error) { res.status(500).json({ message: error.message }); }
+    res.json({
+      success: true,
+      message: delivered ? `OTP resent to ${email}.` : "Email delivery is unavailable — the new OTP has been written to the server logs.",
+    });
+  } catch (error) { res.status(error.statusCode || 500).json({ message: error.message }); }
 };
 
 const createCompany = async (req, res) => {
