@@ -33,10 +33,7 @@ const { trialStartedEmail } = require("../utils/trialEmailTemplates");
 const { resolvePlanPricing, normalizePlanKey } = require("../utils/planPricing");
 const { nextInvoiceNumber, fallbackInvoiceNumber } = require("../utils/invoiceNumber");
 
-const razorpay = new Razorpay({
-  key_id:     process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
+const { razorpay } = require("../utils/razorpayClient");
 
 // "onetime" by default so it works on accounts WITHOUT recurring enabled.
 const BILLING_MODE      = (process.env.TRIAL_BILLING_MODE || "onetime").toLowerCase();

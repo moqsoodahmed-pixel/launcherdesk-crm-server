@@ -27,10 +27,7 @@ const { sendAddonReceipt } = require("../services/addonReceiptService");
 const { resolvePlanPricing } = require("../utils/planPricing");
 const { nextInvoiceNumber, fallbackInvoiceNumber } = require("../utils/invoiceNumber");
 
-const razorpay = new Razorpay({
-  key_id:     process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
+const { razorpay } = require("../utils/razorpayClient");
 
 // Plan pricing is resolved from PlanConfig (the same source the upgrade page
 // renders) via resolvePlanPricing() — no hardcoded prices here, so the amount

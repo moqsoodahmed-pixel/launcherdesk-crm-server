@@ -17,6 +17,7 @@ const generateToken = require("../utils/generateToken");
 const { sendEmail }           = require("../utils/brevoMailer");
 const { companyWelcomeEmail } = require("../utils/emailTemplates");
 const { generateCompanyKey, encryptCompanyKey, computeHmac } = require("../utils/companyKeyCrypto");
+const { sanitizePlainText } = require("../utils/sanitizeHtml");
 
 // New dependencies for Phase 3 additions
 const CompanyAddon        = require("../models/CompanyAddon");
@@ -176,7 +177,9 @@ const _createCompanyHandler = async (req, res) => {
 
     if (req.files?.logo?.[0])       companyData.logo = req.files.logo[0].path;
     if (headerName !== undefined && String(headerName).trim())
-      companyData.headerName = String(headerName).trim().slice(0, 40);
+      // SECURITY FIX: strip HTML/script tags — headerName is rendered verbatim
+      // in the UI header bar, so this closes a stored-XSS vector.
+      companyData.headerName = sanitizePlainText(String(headerName)).slice(0, 40);
     if (req.files?.headerLogo?.[0]) companyData.headerLogoUrl = req.files.headerLogo[0].path;
 
     const company = await Company.create(companyData);
@@ -320,7 +323,9 @@ const _updateCompanyHandler = async (req, res) => {
     if (name)  company.name  = name;
     if (phone !== undefined) company.phone = phone;
     if (plan && ["trial","basic","pro","enterprise"].includes(plan)) company.plan = plan;
-    if (headerName !== undefined) company.headerName = String(headerName).trim().slice(0, 40);
+    // SECURITY FIX: strip HTML/script tags — headerName is rendered verbatim
+    // in the UI header bar, so this closes a stored-XSS vector.
+    if (headerName !== undefined) company.headerName = sanitizePlainText(String(headerName)).slice(0, 40);
     if (req.files?.logo?.[0])       company.logo = req.files.logo[0].path;
     if (req.files?.headerLogo?.[0]) company.headerLogoUrl = req.files.headerLogo[0].path;
 

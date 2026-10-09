@@ -311,8 +311,22 @@ const protectUnified = async (req, res, next) => {
       if (!req.user) {
         const legacySuperAdmin = await SuperAdmin.findById(decoded.id).select("-password");
         if (legacySuperAdmin) {
+          // BUGFIX: the legacy SuperAdmin collection has no `company` field (it
+          // only ever existed for OTP-login verification), so requests from this
+          // identity were failing companyIsolation with 403 "No company assigned
+          // to this account" on every company-scoped super-admin endpoint.
+          // Per the architecture (see scripts/seedAccounts.js), every real super
+          // admin also has a matching per-company record in the Admin collection
+          // under the same email — resolve the company from there.
+          const matchingAdmin = await Admin.findOne({ email: legacySuperAdmin.email })
+            .select("company")
+            .populate("company");
           // Always force role to "super_admin" regardless of what the model stores
-          req.user = { ...legacySuperAdmin.toObject(), role: "super_admin" };
+          req.user = {
+            ...legacySuperAdmin.toObject(),
+            role: "super_admin",
+            company: matchingAdmin?.company || undefined,
+          };
         }
       }
     } else {

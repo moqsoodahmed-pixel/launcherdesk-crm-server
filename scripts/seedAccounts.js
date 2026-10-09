@@ -31,19 +31,19 @@ const CONFIG = {
   superAdmin: {
     name:     process.env.SEED_SUPERADMIN_NAME     || "Super Admin",
     email:    process.env.SEED_SUPERADMIN_EMAIL    || "superadmin@launcherdesk.com",
-    password: process.env.SEED_SUPERADMIN_PASSWORD || "SuperAdmin@123",
+    password: process.env.SEED_SUPERADMIN_PASSWORD || "LauncherDesk@2025!",
   },
 
   admin: {
     name:     process.env.SEED_ADMIN_NAME     || "Admin User",
     email:    process.env.SEED_ADMIN_EMAIL    || "admin@launcherdesk.com",
-    password: process.env.SEED_ADMIN_PASSWORD || "Admin@12345",
+    password: process.env.SEED_ADMIN_PASSWORD || "LauncherDesk@2025!",
   },
 
   employee: {
     name:     process.env.SEED_EMPLOYEE_NAME     || "Employee User",
     email:    process.env.SEED_EMPLOYEE_EMAIL    || "employee@launcherdesk.com",
-    password: process.env.SEED_EMPLOYEE_PASSWORD || "Employee@12345",
+    password: process.env.SEED_EMPLOYEE_PASSWORD || "LauncherDesk@2025!",
   },
 };
 

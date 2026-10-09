@@ -24,10 +24,7 @@ const Payment      = require("../models/Payment");
 const { logAudit } = require("../services/entitlementService");
 const { nextInvoiceNumber, fallbackInvoiceNumber } = require("../utils/invoiceNumber");
 
-const razorpay = new Razorpay({
-  key_id:     process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
+const { razorpay } = require("../utils/razorpayClient");
 
 // Resolve a buyable catalogue row for this company's plan, or null.
 async function resolveBuyableAddon(addonType, planKey) {

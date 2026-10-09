@@ -6,6 +6,7 @@ const Lead    = require("../models/Leads");
 const Company = require("../models/Company");
 const { getAdminLeadScope, mergeLeadScope } = require("../utils/adminLeadScope");
 const { logAuditEvent } = require("../utils/auditLogger");
+const { sanitizePlainText } = require("../utils/sanitizeHtml");
 const multer  = require("multer");
 const path    = require("path");
 const fs      = require("fs");
@@ -762,7 +763,9 @@ const updateCompanyBrand = (req, res) => {
 
       const updates = {};
       if (req.body.name !== undefined) {
-        updates.brandName = req.body.name.trim().slice(0, 40);
+        // SECURITY FIX: strip HTML/script tags before persisting — brandName is
+        // rendered verbatim in the UI header, so this closes a stored-XSS vector.
+        updates.brandName = sanitizePlainText(req.body.name).slice(0, 40);
       }
       if (req.file) {
         updates.brandLogoUrl = req.file.path;

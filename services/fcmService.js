@@ -46,7 +46,7 @@ function getMessaging() {
     if (!admin.apps.length) {
       const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
-      if (serviceAccountJson) {
+      if (serviceAccountJson && serviceAccountJson.trim() && !serviceAccountJson.startsWith('your_')) {
         let parsed;
         try {
           parsed = JSON.parse(serviceAccountJson);
@@ -69,14 +69,8 @@ function getMessaging() {
         console.log('[FCM] ✅ Firebase Admin initialized from GOOGLE_APPLICATION_CREDENTIALS');
 
       } else {
-        _initError = (
-          'Neither FIREBASE_SERVICE_ACCOUNT_JSON nor GOOGLE_APPLICATION_CREDENTIALS is set.\n' +
-          '  → Push notifications are DISABLED.\n' +
-          '  → Set FIREBASE_SERVICE_ACCOUNT_JSON in your Render environment variables.\n' +
-          '  → Value = entire contents of the Firebase service account JSON file.'
-        );
+        _initError = 'Push notifications are not configured (FIREBASE_SERVICE_ACCOUNT_JSON not set).';
         _initFailed = true;
-        console.error('[FCM] ❌', _initError);
         return null;
       }
     }
@@ -103,10 +97,7 @@ function checkFCMHealth() {
   if (m) {
     console.log('[FCM] ✅ Health check passed — push notifications are active.');
   } else {
-    console.error(
-      '[FCM] ❌ Health check FAILED — push notifications will not be sent.\n' +
-      '  Reason:', _initError || 'unknown'
-    );
+    console.log('[FCM] ℹ️  Push notifications are disabled in local dev (no Firebase credentials).');
   }
 }
 

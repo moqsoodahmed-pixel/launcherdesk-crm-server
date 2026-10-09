@@ -176,17 +176,27 @@ async function isDynamicOriginAllowed(origin) {
   }
 }
 
+const isAllowedOrigin = async (origin) => {
+  if (!origin) return true;
+  // Allow any localhost / 127.0.0.1 port in dev (e.g. 5173, 5174, 5175, etc.)
+  if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return true;
+  if (staticAllowedOrigins.includes(origin)) return true;
+  return await isDynamicOriginAllowed(origin);
+};
+
 const corsOptions = {
   origin: async (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (staticAllowedOrigins.includes(origin)) return callback(null, true);
-    const allowed = await isDynamicOriginAllowed(origin);
-    if (allowed) {
-      console.log(`✅ CORS allowed for registered website: ${origin}`);
-      return callback(null, true);
+    try {
+      const allowed = await isAllowedOrigin(origin);
+      if (allowed) {
+        return callback(null, true);
+      }
+      console.warn(`⚠️  CORS blocked unknown origin: ${origin}`);
+      return callback(null, false);
+    } catch (err) {
+      console.error("CORS check error:", err.message);
+      return callback(null, false);
     }
-    console.warn(`⚠️  CORS blocked unknown origin: ${origin}`);
-    callback(new Error(`CORS blocked: ${origin}`));
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
@@ -197,11 +207,13 @@ const corsOptions = {
 const io = new Server(server, {
   cors: {
     origin: async (origin, callback) => {
-      if (!origin) return callback(null, true);
-      if (staticAllowedOrigins.includes(origin)) return callback(null, true);
-      const allowed = await isDynamicOriginAllowed(origin);
-      if (allowed) return callback(null, true);
-      callback(new Error(`CORS blocked: ${origin}`));
+      try {
+        const allowed = await isAllowedOrigin(origin);
+        if (allowed) return callback(null, true);
+        return callback(null, false);
+      } catch (err) {
+        return callback(null, false);
+      }
     },
     credentials: true,
   },

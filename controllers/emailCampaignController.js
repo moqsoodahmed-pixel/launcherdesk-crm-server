@@ -43,23 +43,39 @@ const sendViaBrevo = async ({ to, toName, subject, html, fromName, companyId }) 
     );
   }
 
-  await axios.post(
-    "https://api.brevo.com/v3/smtp/email",
-    {
-      sender: { name: dbFromName || "CRM", email: fromEmail },
-      // Brevo requires `to` to be an array of { email, name } objects — a bare
-      // string is rejected with a validation error and the email never sends.
-      to: [{ email: to, name: toName || to }],
-      subject,
-      htmlContent: html,
-    },
-    {
-      headers: {
-        "api-key": apiKey,
-        "Content-Type": "application/json",
+  try {
+    await axios.post(
+      "https://api.brevo.com/v3/smtp/email",
+      {
+        sender: { name: dbFromName || "CRM", email: fromEmail },
+        // Brevo requires `to` to be an array of { email, name } objects — a bare
+        // string is rejected with a validation error and the email never sends.
+        to: [{ email: to, name: toName || to }],
+        subject,
+        htmlContent: html,
       },
-    },
-  );
+      {
+        headers: {
+          "api-key": apiKey,
+          "Content-Type": "application/json",
+        },
+      },
+    );
+  } catch (err) {
+    // BUGFIX: the raw axios error ("Request failed with status code 401") was
+    // propagating straight to the UI, which is meaningless to an admin — it
+    // doesn't say WHAT was rejected or WHERE to fix it. Brevo returns 401 for
+    // an invalid/revoked API key specifically; surface that the same way the
+    // "not connected" case above already does, pointing at the fix.
+    if (err.response?.status === 401) {
+      throw new Error(
+        "Email (Brevo) rejected the saved API key for your company. " +
+        "Go to Communications → Integrations → Email and reconnect your Brevo account with a valid key."
+      );
+    }
+    const brevoMessage = err.response?.data?.message;
+    throw new Error(brevoMessage ? `Email (Brevo) error: ${brevoMessage}` : err.message);
+  }
 };
 
 // ── Smart email sender: MSG91 first → Brevo fallback ──────────────────────────
