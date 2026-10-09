@@ -68,9 +68,15 @@ const sendViaBrevo = async ({ to, toName, subject, html, fromName, companyId }) 
     // an invalid/revoked API key specifically; surface that the same way the
     // "not connected" case above already does, pointing at the fix.
     if (err.response?.status === 401) {
+      // Brevo's own 401 body is specific and worth surfacing verbatim — e.g.
+      // {"message":"Key not found","code":"unauthorized"} means the key string
+      // itself is wrong/revoked, as opposed to a permissions-scope rejection.
+      const brevoReason = err.response?.data?.message;
       throw new Error(
-        "Email (Brevo) rejected the saved API key for your company. " +
-        "Go to Communications → Integrations → Email and reconnect your Brevo account with a valid key."
+        `Email (Brevo) rejected the saved API key for your company${brevoReason ? ` (Brevo says: "${brevoReason}")` : ""}. ` +
+        "Go to Communications → Integrations → Email and reconnect your Brevo account with a valid key. " +
+        "Double-check: no extra spaces when pasting, the key is active (not revoked) in your Brevo dashboard, " +
+        "and it has \"Transactional emails / SMTP\" permission enabled."
       );
     }
     const brevoMessage = err.response?.data?.message;
