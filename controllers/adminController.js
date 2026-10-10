@@ -790,6 +790,36 @@ const deleteCompanyLogo = async (req, res) => {
 };
 
 // ── Brevo config ──────────────────────────────────────────────────────────────
+// ── Integrations context ──────────────────────────────────────────────────────
+// Tells the Integrations modal whether this caller may switch between
+// companies, and (if so) hands it the list to switch between.
+//
+// `req.admin.isSuperAdmin` is ONLY ever set to true by protectAdmin's legacy
+// SuperAdmin fallback branch (middlewares/adminAuthMiddleware.js) — a regular
+// company Admin, even one with role "super_admin", resolves via the earlier
+// Admin.findById branch and never gets this flag. That means this endpoint
+// can never leak the company list to a company-scoped admin, only to the
+// actual platform-level SuperAdmin.
+const getIntegrationsContext = async (req, res) => {
+  try {
+    const isPlatformSuperAdmin = req.admin?.isSuperAdmin === true;
+    const currentCompanyId = (req.admin?.company?._id || req.admin?.company || "").toString();
+
+    if (!isPlatformSuperAdmin) {
+      return res.json({ isPlatformSuperAdmin: false, companies: [], currentCompanyId });
+    }
+
+    const companies = await Company.find()
+      .select("_id name")
+      .sort({ name: 1 })
+      .lean();
+
+    res.json({ isPlatformSuperAdmin: true, companies, currentCompanyId });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
 const getBrevoConfig = async (req, res) => {
   try {
     const companyId = req.admin?.company?._id || req.admin?.company;
@@ -1400,6 +1430,7 @@ module.exports = {
   getCompanyBrand,
   updateCompanyBrand,
   deleteCompanyLogo,
+  getIntegrationsContext,
   getBrevoConfig,
   saveBrevoFullConfig,
   deleteBrevoConfig,

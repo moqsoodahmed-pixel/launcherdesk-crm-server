@@ -32,6 +32,7 @@ const {
   // getBrevoStatus,
   // saveBrevoConfig,
   // ── New integration config handlers ──────────────────────────────────────
+  getIntegrationsContext,
   getBrevoConfig,
   saveBrevoFullConfig,
   deleteBrevoConfig,
@@ -142,6 +143,14 @@ router.get("/company/brand",         protectAdmin, getCompanyBrand);
 router.get("/company/brand/public",  protectAny,   getCompanyBrand);   // accessible to employee (user) tokens
 router.put("/company/brand",         protectAdmin, requireCompanySuperAdmin, updateCompanyBrand);
 router.delete("/company/brand/logo", protectAdmin, requireCompanySuperAdmin, deleteCompanyLogo);
+
+// ── Integrations context — tells the Integrations modal whether the caller is
+// the platform-level super admin (can switch between companies) and, if so,
+// hands it the company list for the switcher. req.admin.isSuperAdmin is only
+// ever set by protectAdmin's legacy-SuperAdmin fallback branch, so a normal
+// company admin (even one with role "super_admin") always gets back
+// isPlatformSuperAdmin: false and an empty list — never another company's data.
+router.get("/company/integrations-context", protectAdmin, getIntegrationsContext);
 
 // ── Brevo email config (full: GET + PUT + DELETE) ─────────────────────────────
 router.get("/company/brevo-config",    protectAdmin, getBrevoConfig);
