@@ -29,6 +29,18 @@ const sanitizeFields = (fields) =>
 const superAdminId = (req) =>
   req.superAdmin?._id || req.user?._id || req.admin?._id || null;
 
+// ── Ownership guard ────────────────────────────────────────────────────────────
+// A company's own super_admin-role Admin passes the same protectSuperAdmin
+// middleware as the real platform SuperAdmin (see middlewares/superAdminMiddleware.js),
+// so without this check they could read/edit/delete another company's
+// financial reports just by guessing a report id. The platform SuperAdmin
+// (req.isPlatformSuperAdmin) may access any report.
+function ownsReport(req, report) {
+  if (req.isPlatformSuperAdmin) return true;
+  const ownId = req.superAdmin?.company?.toString();
+  return !!ownId && ownId === report.company?.toString();
+}
+
 // ── Create ──────────────────────────────────────────────────────────────────
 const createCustomReport = async (req, res) => {
   try {
@@ -85,6 +97,7 @@ const getCustomReport = async (req, res) => {
   try {
     const report = await CustomReport.findById(req.params.id).lean();
     if (!report) return res.status(404).json({ message: "Report not found" });
+    if (!ownsReport(req, report)) return res.status(403).json({ message: "Access denied" });
     res.json(report);
   } catch (e) {
     res.status(500).json({ message: e.message });
@@ -96,6 +109,7 @@ const updateCustomReport = async (req, res) => {
   try {
     const report = await CustomReport.findById(req.params.id);
     if (!report) return res.status(404).json({ message: "Report not found" });
+    if (!ownsReport(req, report)) return res.status(403).json({ message: "Access denied" });
 
     const { title, periodStart, periodEnd, currency, fields } = req.body;
     if (title !== undefined)       report.title       = String(title).trim();
@@ -123,8 +137,10 @@ const updateCustomReport = async (req, res) => {
 // ── Delete ──────────────────────────────────────────────────────────────────
 const deleteCustomReport = async (req, res) => {
   try {
-    const deleted = await CustomReport.findByIdAndDelete(req.params.id);
-    if (!deleted) return res.status(404).json({ message: "Report not found" });
+    const existing = await CustomReport.findById(req.params.id).select("company").lean();
+    if (!existing) return res.status(404).json({ message: "Report not found" });
+    if (!ownsReport(req, existing)) return res.status(403).json({ message: "Access denied" });
+    await CustomReport.findByIdAndDelete(req.params.id);
     res.json({ message: "Report deleted" });
   } catch (e) {
     res.status(500).json({ message: e.message });
@@ -139,6 +155,7 @@ const getCustomReportTrends = async (req, res) => {
   try {
     const current = await CustomReport.findById(req.params.id).lean();
     if (!current) return res.status(404).json({ message: "Report not found" });
+    if (!ownsReport(req, current)) return res.status(403).json({ message: "Access denied" });
 
     // All reports for this company, oldest → newest, for the time series.
     const series = await CustomReport.find({ company: current.company })
@@ -206,6 +223,7 @@ const getCustomReportLeadMetrics = async (req, res) => {
   try {
     const report = await CustomReport.findById(req.params.id).lean();
     if (!report) return res.status(404).json({ message: "Report not found" });
+    if (!ownsReport(req, report)) return res.status(403).json({ message: "Access denied" });
 
     const start = new Date(report.periodStart);
     const end   = new Date(report.periodEnd);
@@ -283,6 +301,7 @@ const analyzeCustomReport = async (req, res) => {
   try {
     const report = await CustomReport.findById(req.params.id).lean();
     if (!report) return res.status(404).json({ message: "Report not found" });
+    if (!ownsReport(req, report)) return res.status(403).json({ message: "Access denied" });
 
     const prior = await CustomReport.find({
       company:   report.company,
