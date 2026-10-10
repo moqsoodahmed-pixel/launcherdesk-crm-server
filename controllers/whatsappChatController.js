@@ -94,12 +94,39 @@ function describeWaApiError(apiErr, context = "WA send") {
   });
 
   // Pick the most specific human-readable message available.
+  // MSG91 (and other providers) use several different shapes for error
+  // bodies depending on the endpoint — {message}, {error.message},
+  // {errors: [...]}, {errors: {field: ["msg"]}}, a bare string, or a
+  // {hasError, message} object. Try each shape before giving up and
+  // falling back to axios's generic "Request failed with status code N",
+  // which told the user nothing about what actually went wrong.
+  const flattenErrors = (errors) => {
+    if (!errors) return null;
+    if (typeof errors === "string") return errors;
+    if (Array.isArray(errors)) {
+      return errors
+        .map((e) => (typeof e === "string" ? e : e?.message || JSON.stringify(e)))
+        .filter(Boolean)
+        .join("; ");
+    }
+    if (typeof errors === "object") {
+      return Object.entries(errors)
+        .map(([field, msgs]) => `${field}: ${Array.isArray(msgs) ? msgs.join(", ") : msgs}`)
+        .join("; ");
+    }
+    return null;
+  };
+
   const apiMsg =
     body?.message ||
     body?.error?.message ||
-    body?.errors?.[0]?.message ||
+    (typeof body?.error === "string" ? body.error : null) ||
+    flattenErrors(body?.errors) ||
     (typeof body === "string" && body.trim()
       ? body.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 200)
+      : null) ||
+    (body && typeof body === "object" && Object.keys(body).length
+      ? JSON.stringify(body).slice(0, 300)
       : null) ||
     apiErr?.message;
 
